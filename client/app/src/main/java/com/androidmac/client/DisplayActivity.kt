@@ -14,6 +14,7 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
 import com.androidmac.client.service.DisplayService
 import com.androidmac.client.touch.TouchEvent
@@ -79,6 +80,10 @@ class DisplayActivity : AppCompatActivity() {
         setContentView(R.layout.activity_display)
 
         enterImmersiveMode()
+
+        // Acting as a monitor: no touch for a while is normal, so keep the screen on
+        // and at full brightness (without this Android dims it, then sleeps).
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         videoWidth = intent.getIntExtra("width", 1920)
         videoHeight = intent.getIntExtra("height", 1080)

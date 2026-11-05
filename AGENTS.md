@@ -64,7 +64,7 @@ Logs: the mac app writes the server log to `~/Library/Logs/AndroidDisplay.log` (
 - The display position is saved in global coordinates to `~/Library/Application Support/AndroidDisplay/display-origin`. If other displays are rearranged, the saved spot may be stale. Moving it once in System Settings fixes it.
 - Changing scale or bitrate requires a new connection: the client sizes its decoder from ServerHello.
 - Port 9000 is fixed. "address already in use" means another server instance is still running.
-- On the phone, set `adb shell settings put global stay_on_while_plugged_in 7` so the screen does not sleep. Some phones report charging over USB as AC, and plain `2` (USB only) has no effect on them.
+- While streaming, `DisplayActivity` sets `FLAG_KEEP_SCREEN_ON`, so the phone neither dims nor sleeps. To keep the connect screen awake too, use `adb shell settings put global stay_on_while_plugged_in 7`. Some phones report USB charging as AC, so `2` (USB only) does nothing on them.
 
 ## Tests
 
