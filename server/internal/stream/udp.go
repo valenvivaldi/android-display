@@ -3,7 +3,6 @@ package stream
 import (
 	"net"
 	"sync/atomic"
-	"time"
 )
 
 // UDPStreamer sends H.264 NAL units over UDP, automatically fragmenting
@@ -32,10 +31,9 @@ func NewUDPStreamer(targetAddr string) (*UDPStreamer, error) {
 // SendFrame serializes a NAL unit into one or more UDP packets and
 // transmits them to the configured target address. Large NAL units are
 // automatically split into MaxPayloadSize-byte fragments.
-func (s *UDPStreamer) SendFrame(nalUnit []byte, frameType byte) error {
+func (s *UDPStreamer) SendFrame(nalUnit []byte, frameType byte, captureMicros uint64) error {
 	seq := s.sequence.Add(1)
-	timestamp := uint64(time.Now().UnixMicro())
-	packets := SplitIntoPackets(seq, timestamp, frameType, nalUnit)
+	packets := SplitIntoPackets(seq, captureMicros, frameType, nalUnit)
 
 	for _, pkt := range packets {
 		data := pkt.MarshalPacket()

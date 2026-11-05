@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/luke/android-mac/server/internal/adb"
 	"github.com/luke/android-mac/server/internal/capture"
@@ -34,6 +37,17 @@ var adbManager *adb.Manager
 var tcpVideoServer *stream.TCPVideoServer
 
 func main() {
+	scale := flag.Float64("scale", 1.0, "streamed resolution as a fraction of the device's native screen (0.25-1)")
+	bitrate := flag.Int("bitrate", defaultBitrate, "video bitrate in bits per second")
+	exitOnStdinEOF := flag.Bool("exit-on-stdin-eof", false, "shut down when stdin closes (set by the Mac app so the server dies with it)")
+	flag.Parse()
+	if *scale < 0.25 || *scale > 1 {
+		log.Fatalf("-scale must be between 0.25 and 1, got %v", *scale)
+	}
+	if *bitrate <= 0 {
+		log.Fatalf("-bitrate must be positive, got %d", *bitrate)
+	}
+
 	log.Println("android-mac server starting...")
 
 	// 1. Start touch TCP server (auto-assign port)
@@ -86,7 +100,7 @@ func main() {
 	log.Printf("mDNS advertising on port %d", controlPort)
 
 	// 5. Start TCP control server
-	ctrlServer, err := control.NewServer(controlPort)
+	ctrlServer, err := control.NewServer(controlPort, *scale, *bitrate)
 	if err != nil {
 		log.Fatalf("control server failed: %v", err)
 	}
@@ -96,13 +110,7 @@ func main() {
 
 	// 6. On client connect → start the capture-encode-stream pipeline
 	ctrlServer.OnClient(func(client control.ClientConn) {
-		w := client.Hello.Screen.Width
-		h := client.Hello.Screen.Height
-		bitrate := client.Hello.Bitrate
-		if bitrate <= 0 {
-			bitrate = defaultBitrate
-		}
-		log.Printf("client requested bitrate: %d bps", bitrate)
+		w, h, bitrate := client.Width, client.Height, client.Bitrate
 
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -139,6 +147,12 @@ func main() {
 	// 7. Wait for SIGINT/SIGTERM
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	if *exitOnStdinEOF {
+		go func() {
+			io.Copy(io.Discard, os.Stdin)
+			sig <- syscall.SIGTERM
+		}()
+	}
 	<-sig
 	log.Println("shutting down...")
 
@@ -193,6 +207,25 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 	defer vd.Close()
 	log.Printf("virtual display created: 0x%x (%dx%d)", vd.DisplayID(), width, height)
 
+	// macOS places a new virtual display at a default spot; put it back where the
+	// user last arranged it. The position is saved whenever it changes (polled,
+	// since a SIGTERM restart exits without running this function's defers).
+	if x, y, ok := loadDisplayOrigin(); ok {
+		if err := vd.SetOrigin(x, y); err != nil {
+			log.Printf("restore display position: %v", err)
+		} else {
+			log.Printf("display position restored: (%d,%d)", x, y)
+		}
+	}
+	stopTracking := make(chan struct{})
+	trackingDone := make(chan struct{})
+	go trackDisplayOrigin(vd, stopTracking, trackingDone)
+	// Registered after vd.Close, so it runs first: tracking stops before the display is destroyed.
+	defer func() {
+		close(stopTracking)
+		<-trackingDone
+	}()
+
 	// Input injector + gesture recognizer for this display
 	injector := input.NewInjector(vd.DisplayID())
 	gesture := input.NewGestureRecognizer(func(me input.MouseEvent) {
@@ -235,6 +268,9 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 	defer touchServer.OnEvent(nil)
 	log.Println("touch input enabled")
 
+	stats := newPipelineStats()
+	go stats.run(ctx, 2*time.Second)
+
 	// H.264 encoder
 	enc, err := encoder.New(encoder.Config{
 		Width:   width,
@@ -253,8 +289,17 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 		default:
 			ft = stream.FrameTypeP
 		}
-		if err := videoStreamer.SendFrame(nal.Data, ft); err != nil {
+		// nal.Timestamp is the capture time on the mach clock; translate it to
+		// Unix time for the packet header so the phone can measure latency.
+		sinceCapture := time.Duration(capture.NowMicros()-nal.Timestamp) * time.Microsecond
+		captureUnix := time.Now().Add(-sinceCapture).UnixMicro()
+		sendStart := time.Now()
+		if err := videoStreamer.SendFrame(nal.Data, ft, uint64(captureUnix)); err != nil {
 			log.Printf("stream send error: %v", err)
+		}
+		stats.recordBytes(len(nal.Data))
+		if ft == stream.FrameTypeIDR || ft == stream.FrameTypeP {
+			stats.recordFrame(sinceCapture, time.Since(sendStart))
 		}
 	})
 	if err != nil {
@@ -279,4 +324,69 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 	log.Println("pipeline active (video + touch)")
 	<-ctx.Done()
 	log.Println("pipeline stopping...")
+}
+
+// trackDisplayOrigin saves the display's position whenever the user moves it,
+// and once more when stop is closed.
+func trackDisplayOrigin(vd *display.VirtualDisplay, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	lastX, lastY := vd.Origin()
+	save := func() {
+		x, y := vd.Origin()
+		if x == lastX && y == lastY {
+			return
+		}
+		if err := saveDisplayOrigin(x, y); err != nil {
+			log.Printf("save display position: %v", err)
+			return
+		}
+		lastX, lastY = x, y
+		log.Printf("display position saved: (%d,%d)", x, y)
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			save()
+			return
+		case <-ticker.C:
+			save()
+		}
+	}
+}
+
+// displayOriginPath is where the virtual display's last position is stored.
+func displayOriginPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "AndroidDisplay", "display-origin"), nil
+}
+
+func loadDisplayOrigin() (x, y int, ok bool) {
+	path, err := displayOriginPath()
+	if err != nil {
+		return 0, 0, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(string(data), "%d %d", &x, &y); err != nil {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+func saveDisplayOrigin(x, y int) error {
+	path, err := displayOriginPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d %d\n", x, y)), 0o644)
 }

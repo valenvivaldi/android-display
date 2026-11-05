@@ -84,7 +84,7 @@ func (s *TCPVideoServer) AcceptOne() error {
 // Optimized for zero per-frame heap allocations:
 //   - Frame buffer is recycled via sync.Pool
 //   - Header is serialized inline (no PacketHeader struct or Marshal call)
-func (s *TCPVideoServer) SendFrame(nalUnit []byte, frameType byte) error {
+func (s *TCPVideoServer) SendFrame(nalUnit []byte, frameType byte, captureMicros uint64) error {
 	s.mu.Lock()
 	conn := s.conn
 	s.mu.Unlock()
@@ -94,7 +94,7 @@ func (s *TCPVideoServer) SendFrame(nalUnit []byte, frameType byte) error {
 	}
 
 	seq := s.sequence.Add(1)
-	timestamp := uint64(time.Now().UnixMicro())
+	timestamp := captureMicros
 
 	// Total wire size: 4-byte length prefix + 17-byte header + payload
 	totalLen := PacketHeaderSize + len(nalUnit)

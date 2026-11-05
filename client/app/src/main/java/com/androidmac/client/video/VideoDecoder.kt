@@ -66,13 +66,19 @@ class VideoDecoder(
         try {
             format.setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = realtime
         } catch (_: Exception) {}
+        // Qualcomm decoders (c2.qti.* / OMX.qcom.*) ignore KEY_LOW_LATENCY unless they declare the
+        // low-latency feature, and otherwise hold ~8 frames (~130 ms at 60 fps) before output.
+        // These vendor keys make them output each frame as soon as it is decoded; other decoders
+        // ignore unknown keys.
+        format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+        format.setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
 
         codec = MediaCodec.createDecoderByType(MIME).apply {
             setCallback(codecCallback, Handler(thread.looper))
             configure(format, surface, null, 0)
             start()
         }
-        Log.d(TAG, "Decoder started (async): ${width}x${height}")
+        Log.d(TAG, "Decoder started (async): ${codec?.name} ${width}x${height}")
     }
 
     private val codecCallback = object : MediaCodec.Callback() {
@@ -88,6 +94,8 @@ class VideoDecoder(
         }
 
         override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+            // presentationTimeUs carries the frame's capture time on the Mac (packet header).
+            LatencyStats.onDecoded(info.presentationTimeUs)
             try {
                 mc.releaseOutputBuffer(index, true)
             } catch (e: Exception) {
@@ -135,6 +143,7 @@ class VideoDecoder(
             frameType != FRAME_TYPE_SPS &&
             frameType != FRAME_TYPE_PPS &&
             frameType != FRAME_TYPE_IDR) {
+            LatencyStats.onDecoderDrop()
             return
         }
 
@@ -145,6 +154,7 @@ class VideoDecoder(
                 feedBuffer(mc, idx, entry)
             } else {
                 nalQueue.offer(entry)
+                LatencyStats.onQueueDepth(nalQueue.size)
             }
         }
     }

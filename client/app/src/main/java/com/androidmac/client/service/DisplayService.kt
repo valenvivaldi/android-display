@@ -19,6 +19,7 @@ import com.androidmac.client.R
 import com.androidmac.client.control.ControlClient
 import com.androidmac.client.touch.TouchEvent
 import com.androidmac.client.touch.TouchSender
+import com.androidmac.client.video.LatencyStats
 import com.androidmac.client.video.TcpVideoReceiver
 import com.androidmac.client.video.UdpReceiver
 import com.androidmac.client.video.VideoPacket
@@ -130,6 +131,7 @@ class DisplayService : Service() {
     private val statsRunnable = object : Runnable {
         override fun run() {
             updateNotificationStats()
+            LatencyStats.logAndReset()
             statsHandler.postDelayed(this, STATS_UPDATE_INTERVAL)
         }
     }
@@ -355,6 +357,7 @@ class DisplayService : Service() {
             }
             // 單分片 NAL，直接提交
             submitCount++
+            if (isVideoFrame(packet.frameType)) LatencyStats.onReceived(packet.timestamp)
             videoCallback?.onNAL(packet.payload, packet.frameType, packet.timestamp)
             return
         }
@@ -393,10 +396,14 @@ class DisplayService : Service() {
                 val assembledData = assembled.toByteArray()
                 fragments.clear()
                 submitCount++
+                if (isVideoFrame(ft)) LatencyStats.onReceived(ts)
                 videoCallback?.onNAL(assembledData, ft, ts)
             }
         }
     }
+
+    /** IDR or P frame (SPS/PPS share the frame's timestamp and would double-count). */
+    private fun isVideoFrame(frameType: Byte) = frameType == 0x01.toByte() || frameType == 0x02.toByte()
 
     /**
      * 取得目前的連線統計

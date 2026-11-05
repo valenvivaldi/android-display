@@ -25,7 +25,7 @@ const (
 // PacketHeader is the 17-byte wire header prepended to every UDP packet.
 type PacketHeader struct {
 	Sequence  uint32 // Monotonically increasing packet counter
-	Timestamp uint64 // Frame presentation timestamp (nanoseconds)
+	Timestamp uint64 // Frame capture time (Unix microseconds, Mac clock)
 	FrameType byte   // NAL unit type (IDR, P, B, SPS, PPS)
 	FragIndex uint16 // Fragment index within this frame (0-based)
 	FragTotal uint16 // Total number of fragments for this frame
