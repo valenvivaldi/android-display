@@ -65,6 +65,7 @@ Logs: the mac app writes the server log to `~/Library/Logs/AndroidDisplay.log` (
 - Changing scale or bitrate requires a new connection: the client sizes its decoder from ServerHello.
 - Port 9000 is fixed. "address already in use" means another server instance is still running.
 - While streaming, `DisplayActivity` sets `FLAG_KEEP_SCREEN_ON`, so the phone neither dims nor sleeps. To keep the connect screen awake too, use `adb shell settings put global stay_on_while_plugged_in 7`. Some phones report USB charging as AC, so `2` (USB only) does nothing on them.
+- Qualcomm decoders (`c2.qti.avc.decoder` and friends) ignore `KEY_LOW_LATENCY` unless they declare the feature. Without `vendor.qti-ext-dec-low-latency.enable` / `vendor.qti-ext-dec-picture-order.enable` they hold about 8 frames (~130 ms). Keep those keys in `VideoDecoder.start()`.
 
 ## Tests
 
@@ -85,6 +86,15 @@ adb shell input tap <x> <y>                                                     
 ```
 
 Then check the log for `pipeline active (video + touch)`. To check touch, tap the centre of the phone and read the cursor position (e.g. a 3-line Swift script printing `CGEvent(source: nil)!.location`). It should land inside the virtual display's `CGDisplayBounds`.
+
+## Measuring latency
+
+Each packet header carries the frame's capture time on the Mac (Unix µs, derived from the `CGDisplayStream` display time). Both sides log a summary every 2 s:
+
+- Mac (server log): `latency mac: encode avg … p95 … ms | send avg … | fps | Mbps`. Encode is measured from the frame's scheduled display time, so it can be slightly negative.
+- Phone (`adb logcat -s Latency`): `recv avg … | decoded avg … | fps | decoder dropped | queue max`.
+
+The phone values include the Mac↔phone clock offset, which can be minutes. `decoded − recv` doesn't depend on it and is the decoder's own delay. For absolute numbers, measure the offset over one persistent `adb shell` session: send `date +%s%N` repeatedly and use phone time minus the midpoint of the Mac send/receive times on the lowest-RTT samples (about ±8 ms). Then subtract the offset. Generate steady motion on the virtual display (e.g. a full-window canvas animation) while measuring. A static desktop only produces frames on change.
 
 ## Conventions
 

@@ -268,6 +268,9 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 	defer touchServer.OnEvent(nil)
 	log.Println("touch input enabled")
 
+	stats := newPipelineStats()
+	go stats.run(ctx, 2*time.Second)
+
 	// H.264 encoder
 	enc, err := encoder.New(encoder.Config{
 		Width:   width,
@@ -286,8 +289,17 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 		default:
 			ft = stream.FrameTypeP
 		}
-		if err := videoStreamer.SendFrame(nal.Data, ft); err != nil {
+		// nal.Timestamp is the capture time on the mach clock; translate it to
+		// Unix time for the packet header so the phone can measure latency.
+		sinceCapture := time.Duration(capture.NowMicros()-nal.Timestamp) * time.Microsecond
+		captureUnix := time.Now().Add(-sinceCapture).UnixMicro()
+		sendStart := time.Now()
+		if err := videoStreamer.SendFrame(nal.Data, ft, uint64(captureUnix)); err != nil {
 			log.Printf("stream send error: %v", err)
+		}
+		stats.recordBytes(len(nal.Data))
+		if ft == stream.FrameTypeIDR || ft == stream.FrameTypeP {
+			stats.recordFrame(sinceCapture, time.Since(sendStart))
 		}
 	})
 	if err != nil {

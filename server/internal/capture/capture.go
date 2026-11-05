@@ -4,8 +4,16 @@ package capture
 #cgo CFLAGS: -x objective-c -fobjc-arc -mmacosx-version-min=14.0 -Wno-deprecated-declarations -I../../bridge
 #cgo LDFLAGS: -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework IOSurface -framework Foundation
 #include "../../bridge/capture_bridge.h"
+#include <mach/mach_time.h>
 
 extern void goFrameCallback(void *pixelBuffer, int width, int height, int64_t timestamp, void *userData);
+
+// Same clock and units as Frame.Timestamp (mach absolute time in µs).
+static int64_t MachNowMicros(void) {
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	return (int64_t)((double)mach_absolute_time() * tb.numer / tb.denom / 1000.0);
+}
 */
 import "C"
 import (
@@ -22,7 +30,13 @@ type Frame struct {
 	PixelBuffer unsafe.Pointer // CVPixelBufferRef — caller must call ReleasePixelBuffer when done
 	Width       int
 	Height      int
-	Timestamp   int64 // presentation timestamp in microseconds
+	Timestamp   int64 // capture time in microseconds on the mach clock (see NowMicros)
+}
+
+// NowMicros returns the current time on the same clock as Frame.Timestamp,
+// so callers can measure how long ago a frame was captured.
+func NowMicros() int64 {
+	return int64(C.MachNowMicros())
 }
 
 // FrameHandler is a callback function invoked for each captured frame.

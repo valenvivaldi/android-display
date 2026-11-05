@@ -25,7 +25,7 @@ func TestUDPStreamerSendAndReceive(t *testing.T) {
 	defer streamer.Close()
 
 	testData := []byte{0x00, 0x00, 0x00, 0x01, 0x67, 0x42} // fake SPS NAL
-	err = streamer.SendFrame(testData, FrameTypeSPS)
+	err = streamer.SendFrame(testData, FrameTypeSPS, 1)
 	if err != nil {
 		t.Fatalf("send error: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestUDPStreamerLargeFrameFragmentation(t *testing.T) {
 	defer streamer.Close()
 
 	largeData := bytes.Repeat([]byte{0xFF}, MaxPayloadSize*3)
-	err := streamer.SendFrame(largeData, FrameTypeIDR)
+	err := streamer.SendFrame(largeData, FrameTypeIDR, 1)
 	if err != nil {
 		t.Fatalf("send error: %v", err)
 	}
