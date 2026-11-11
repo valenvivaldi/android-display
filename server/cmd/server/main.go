@@ -112,6 +112,14 @@ func main() {
 	ctrlServer.SetTouchPort(touchServer.Port())
 	ctrlServer.SetVideoPort(videoServer.Port())
 
+	// Resolution and bitrate come from the Mac app's per-phone settings file;
+	// -scale and -bitrate are what a phone gets when the file says nothing about it.
+	settings, err := defaultSettingsStore(*scale, *bitrate)
+	if err != nil {
+		log.Fatalf("device settings: %v", err)
+	}
+	ctrlServer.SetStreamSettings(settings.lookup)
+
 	// 6. Every client that connects gets its own capture-encode-stream pipeline
 	ctrlServer.OnClient(srv.startSession)
 
