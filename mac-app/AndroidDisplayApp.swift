@@ -27,6 +27,8 @@ private func scaledSize(_ native: (width: Int, height: Int), _ s: Double) -> Str
 struct StreamDefaults: Codable, Equatable {
     var scale: Double
     var bitrate: Int
+    /// How touches reach macOS: "cursor" (default, also when nil), "restore" or "background".
+    var touchMode: String?
 }
 
 /// One phone's own settings. A nil scale/bitrate means "use the default".
@@ -75,9 +77,10 @@ final class SettingsStore: ObservableObject {
     func scale(for id: String) -> Double { file.devices[id]?.scale ?? file.defaults.scale }
     func bitrate(for id: String) -> Int { file.devices[id]?.bitrate ?? file.defaults.bitrate }
 
-    func setDefaults(scale: Double? = nil, bitrate: Int? = nil) {
+    func setDefaults(scale: Double? = nil, bitrate: Int? = nil, touchMode: String? = nil) {
         if let scale { file.defaults.scale = scale }
         if let bitrate { file.defaults.bitrate = bitrate }
+        if let touchMode { file.defaults.touchMode = touchMode }
         save()
     }
 
@@ -452,7 +455,22 @@ struct ContentView: View {
                 )) {
                     ForEach(bitrateOptions, id: \.self) { Text(bitrateLabel($0)).tag($0) }
                 }
+                Picker("Toque", selection: Binding(
+                    get: { settings.defaults.touchMode ?? "cursor" },
+                    set: { settings.setDefaults(touchMode: $0) }
+                )) {
+                    Text("Mueve el cursor (compatible con todo)").tag("cursor")
+                    Text("Devuelve el cursor al terminar").tag("restore")
+                    Text("Sin mover el cursor (experimental)").tag("background")
+                }
             }
+            if (settings.defaults.touchMode ?? "cursor") == "background" {
+                Text("Cada toque va solo a la app que está bajo el dedo. El menú, el Dock y el escritorio igual mueven el cursor, y algunas apps (Chrome, juegos) pueden ignorar el toque.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("El modo de toque se aplica la próxima vez que el celular se conecta.")
+                .font(.callout).foregroundStyle(.secondary)
         }
     }
 

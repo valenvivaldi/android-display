@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/luke/android-mac/server/internal/input"
 )
 
 func newSettings(t *testing.T, contents string) *settingsStore {
@@ -82,5 +84,26 @@ func TestSettingsAreReadOnEveryLookup(t *testing.T) {
 	}
 	if scale, _ := s.lookup("x"); scale != 0.9 {
 		t.Fatalf("after edit: got %v, want 0.9", scale)
+	}
+}
+
+// The touch mode is read from the file's defaults; anything missing or not a mode means
+// the default (the cursor behaviour of every earlier version), never an error.
+func TestSettingsTouchMode(t *testing.T) {
+	for name, tc := range map[string]struct {
+		contents string
+		want     input.Mode
+	}{
+		"missing file":     {"", input.ModeCursor},
+		"not set":          {`{"defaults": {"scale": 0.5}}`, input.ModeCursor},
+		"background":       {`{"defaults": {"touchMode": "background"}}`, input.ModeBackground},
+		"restore":          {`{"defaults": {"touchMode": "restore"}}`, input.ModeRestore},
+		"unknown value":    {`{"defaults": {"touchMode": "telepathy"}}`, input.ModeCursor},
+		"corrupt file":     {`{not json`, input.ModeCursor},
+		"alongside others": {`{"defaults": {"scale": 0.5, "bitrate": 2000000, "touchMode": "background"}}`, input.ModeBackground},
+	} {
+		if got := newSettings(t, tc.contents).touchMode(); got != tc.want {
+			t.Errorf("%s: touch mode %q, want %q", name, got, tc.want)
+		}
 	}
 }

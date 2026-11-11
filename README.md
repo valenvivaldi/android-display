@@ -84,6 +84,8 @@ Each phone's display keeps a stable identity and its last position (System Setti
 
 You can connect several phones at once; each one is its own monitor. In the Mac app, every phone that has connected is listed with its own resolution and quality, plus a default for phones without their own. The choices are stored in `device-settings.json` next to it and apply the next time that phone connects.
 
+By default a touch moves the Mac's real cursor to the phone's display, which takes the cursor away from you. The Mac app's **Toque** setting offers two alternatives: *devolver el cursor al terminar* (it still jumps, then goes back) and *sin mover el cursor (experimental)*, where each touch goes only to the app under the finger and the cursor stays where it is. The experimental mode relies on private macOS APIs, was only tried on macOS 26.2 against a test window, and some apps (Chrome, games) may ignore it. It applies the next time the phone connects.
+
 ## Usage
 
 1. **Start the Mac server** (or open `AndroidDisplay.app`):
