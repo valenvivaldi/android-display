@@ -144,6 +144,63 @@ func TestHandshakeAssignsDistinctSessions(t *testing.T) {
 	}
 }
 
+// Each phone gets the resolution and bitrate chosen for it, not one global value, and
+// the choice is made per handshake (the Mac app can change it while the server runs).
+func TestHandshakeUsesPerDeviceStreamSettings(t *testing.T) {
+	srv, err := NewServer(0, 1, 8_000_000) // defaults for phones the settings don't cover
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Stop()
+	small := true
+	srv.SetStreamSettings(func(deviceID string) (float64, int) {
+		switch deviceID {
+		case "tablet":
+			return 0.5, 2_000_000
+		case "phone":
+			if small {
+				return 0.75, 4_000_000
+			}
+			return 1, 6_000_000
+		}
+		return 1, 8_000_000
+	})
+	go srv.AcceptLoop()
+
+	handshake := func(deviceID string) protocol.ServerHello {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", srv.Addr(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close()
+		hello := protocol.ClientHello{Device: deviceID, DeviceID: deviceID, Screen: protocol.ScreenInfo{Width: 2000, Height: 1000}, Codecs: []string{"h264"}}
+		if err := json.NewEncoder(conn).Encode(hello); err != nil {
+			t.Fatal(err)
+		}
+		var response protocol.ServerHello
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := json.NewDecoder(conn).Decode(&response); err != nil {
+			t.Fatalf("%s: read server hello: %v", deviceID, err)
+		}
+		return response
+	}
+
+	check := func(deviceID string, width, height, bitrate int) {
+		t.Helper()
+		r := handshake(deviceID)
+		if r.VirtualDisplay.Width != width || r.VirtualDisplay.Height != height || r.Bitrate != bitrate {
+			t.Errorf("%s: got %dx%d @ %d, want %dx%d @ %d", deviceID, r.VirtualDisplay.Width, r.VirtualDisplay.Height, r.Bitrate, width, height, bitrate)
+		}
+	}
+	check("tablet", 1000, 500, 2_000_000)
+	check("phone", 1500, 750, 4_000_000)
+	check("unknown", 2000, 1000, 8_000_000)
+
+	small = false
+	check("phone", 2000, 1000, 6_000_000)
+}
+
 func TestHandshakeTimeout(t *testing.T) {
 	srv, err := NewServer(0, 1, 8_000_000)
 	if err != nil {

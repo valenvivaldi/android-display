@@ -80,7 +80,9 @@ mac-app/build.sh   # installs ~/Applications/AndroidDisplay.app
 
 Grant the app Accessibility and Screen Recording permission. `build.sh` signs with a local `AndroidDisplay Local Signing` certificate when it exists in the keychain, so the grants survive rebuilds; otherwise it signs ad hoc and macOS asks again after each build. The server log is at `~/Library/Logs/AndroidDisplay.log`.
 
-The virtual display keeps a stable identity, and its last position (System Settings → Displays → Arrange) is saved to `~/Library/Application Support/AndroidDisplay/display-origin` and restored on the next connection.
+Each phone's display keeps a stable identity and its last position (System Settings → Displays → Arrange), saved per phone in `~/Library/Application Support/AndroidDisplay/display-origins.json` and restored on its next connection.
+
+You can connect several phones at once; each one is its own monitor. In the Mac app, every phone that has connected is listed with its own resolution and quality, plus a default for phones without their own. The choices are stored in `device-settings.json` next to it and apply the next time that phone connects.
 
 ## Usage
 
@@ -88,7 +90,7 @@ The virtual display keeps a stable identity, and its last position (System Setti
    ```bash
    ./server/android-display-server -scale 0.75 -bitrate 4000000
    ```
-   `-scale` (0.25–1, default 1) sets the streamed resolution relative to the device's native screen; `-bitrate` defaults to 8 Mbps. Both are chosen on the Mac — the Android app only reports its native resolution.
+   `-scale` (0.25–1, default 1) sets the streamed resolution relative to the device's native screen; `-bitrate` defaults to 8 Mbps. They are the fallback for phones with no setting of their own (see `device-settings.json`, written by the Mac app). The Android app only reports its native resolution.
 
 2. **Open the Android app** on your tablet — it will auto-discover the Mac via mDNS
 
@@ -102,7 +104,7 @@ For lower latency, connect your Android device via USB:
 
 1. Enable USB debugging on your Android device
 2. Connect via USB cable
-3. Start the server (it will automatically set up ADB reverse forwarding)
+3. Start the server (it sets up ADB reverse forwarding for every attached device, and for phones plugged in later)
 4. Open the Android app and connect
 
 ## Protocol
