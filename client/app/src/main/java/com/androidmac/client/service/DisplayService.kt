@@ -473,7 +473,7 @@ class DisplayService : Service() {
         disconnectCallback = null // the activity handles this as a reconnect, not a plain disconnect
         cleanupConnections()
         callback?.onReconnect(host, type)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
