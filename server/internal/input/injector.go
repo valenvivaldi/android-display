@@ -2,7 +2,7 @@ package input
 
 /*
 #cgo CFLAGS: -x objective-c -I../../bridge
-#cgo LDFLAGS: -framework CoreGraphics -framework ApplicationServices
+#cgo LDFLAGS: -framework CoreGraphics -framework ApplicationServices -framework Foundation
 #include "input_bridge.h"
 */
 import "C"
@@ -14,25 +14,27 @@ type DisplayBounds struct {
 	X, Y, Width, Height float64
 }
 
-// Injector translates normalised touch coordinates into macOS CGEvent
-// mouse actions and posts them via the Quartz Event Services API.
+// Injector translates normalised touch coordinates into macOS mouse actions. How they
+// reach macOS (moving the real cursor, or going straight to the app under the finger)
+// depends on the Mode; pen events always use the hardware path.
 type Injector struct {
 	displayID uint32
+	router    *pointerRouter
 }
 
 // NewInjector creates a new Injector targeting the given display.
 // It logs a warning if Accessibility permission has not been granted.
-func NewInjector(displayID uint32) *Injector {
+func NewInjector(displayID uint32, mode Mode) *Injector {
 	if !bool(C.CheckAccessibilityPermission()) {
 		log.Println("WARNING: Accessibility permission not granted!")
 		log.Println("Go to System Preferences → Privacy & Security → Accessibility")
 		log.Println("and add this application to enable touch input.")
 	}
 
-	inj := &Injector{displayID: displayID}
+	inj := &Injector{displayID: displayID, router: newPointerRouter(mode, cgOps{})}
 	b := inj.bounds()
-	log.Printf("injector: display 0x%x bounds: (%.0f,%.0f) %.0fx%.0f",
-		displayID, b.X, b.Y, b.Width, b.Height)
+	log.Printf("injector: display 0x%x bounds: (%.0f,%.0f) %.0fx%.0f, touch mode %s",
+		displayID, b.X, b.Y, b.Width, b.Height, mode)
 	return inj
 }
 
@@ -56,45 +58,45 @@ func (inj *Injector) ToScreenCoords(nx, ny float32) (float64, float64) {
 	return b.X + float64(nx)*b.Width, b.Y + float64(ny)*b.Height
 }
 
-// MouseMove posts a mouse-moved event at the normalised coordinates.
+// MouseMove is a pointer move at the normalised coordinates, with no button pressed.
 func (inj *Injector) MouseMove(nx, ny float32) {
 	x, y := inj.ToScreenCoords(nx, ny)
-	C.InjectMouseMove(C.double(x), C.double(y))
+	inj.router.move(x, y)
 }
 
-// LeftMouseDown posts a left-mouse-down event at the normalised coordinates.
+// LeftMouseDown presses the left button at the normalised coordinates.
 func (inj *Injector) LeftMouseDown(nx, ny float32) {
 	x, y := inj.ToScreenCoords(nx, ny)
-	C.InjectLeftMouseDown(C.double(x), C.double(y))
+	inj.router.down(buttonLeft, x, y)
 }
 
-// LeftMouseUp posts a left-mouse-up event at the normalised coordinates.
+// LeftMouseUp releases the left button at the normalised coordinates.
 func (inj *Injector) LeftMouseUp(nx, ny float32) {
 	x, y := inj.ToScreenCoords(nx, ny)
-	C.InjectLeftMouseUp(C.double(x), C.double(y))
+	inj.router.up(buttonLeft, x, y)
 }
 
-// LeftMouseDragged posts a left-mouse-dragged event at the normalised coordinates.
+// LeftMouseDragged moves the pointer with the left button held, at the normalised coordinates.
 func (inj *Injector) LeftMouseDragged(nx, ny float32) {
 	x, y := inj.ToScreenCoords(nx, ny)
-	C.InjectLeftMouseDragged(C.double(x), C.double(y))
+	inj.router.drag(x, y)
 }
 
-// RightMouseDown posts a right-mouse-down event at the normalised coordinates.
+// RightMouseDown presses the right button at the normalised coordinates.
 func (inj *Injector) RightMouseDown(nx, ny float32) {
 	x, y := inj.ToScreenCoords(nx, ny)
-	C.InjectRightMouseDown(C.double(x), C.double(y))
+	inj.router.down(buttonRight, x, y)
 }
 
-// RightMouseUp posts a right-mouse-up event at the normalised coordinates.
+// RightMouseUp releases the right button at the normalised coordinates.
 func (inj *Injector) RightMouseUp(nx, ny float32) {
 	x, y := inj.ToScreenCoords(nx, ny)
-	C.InjectRightMouseUp(C.double(x), C.double(y))
+	inj.router.up(buttonRight, x, y)
 }
 
-// ScrollWheel posts a scroll-wheel event with the given pixel deltas.
+// ScrollWheel scrolls with the given pixel deltas, at the finger's last position.
 func (inj *Injector) ScrollWheel(deltaX, deltaY int32) {
-	C.InjectScrollWheel(C.int32_t(deltaX), C.int32_t(deltaY))
+	inj.router.scroll(deltaX, deltaY)
 }
 
 // TabletProximityEnter posts a tablet proximity-enter event.

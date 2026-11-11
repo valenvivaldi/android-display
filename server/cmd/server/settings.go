@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/luke/android-mac/server/internal/input"
 )
 
 // settingsFile is device-settings.json, written by the Mac app and read by the
@@ -14,16 +16,22 @@ import (
 // without restarting the server.
 //
 //	{
-//	  "defaults": { "scale": 0.75, "bitrate": 4000000 },
+//	  "defaults": { "scale": 0.75, "bitrate": 4000000, "touchMode": "background" },
 //	  "devices": {
 //	    "<device id>": { "name": "moto g(9) plus", "scale": 1.0, "bitrate": 8000000 }
 //	  }
 //	}
 //
-// A missing or zero scale/bitrate means "not set": the next level applies.
+// A missing or zero scale/bitrate means "not set": the next level applies. touchMode
+// ("cursor", "restore" or "background", see input.Mode) is global, not per phone.
 type settingsFile struct {
-	Defaults streamSettings         `json:"defaults"`
+	Defaults defaultSettings        `json:"defaults"`
 	Devices  map[string]deviceEntry `json:"devices"`
+}
+
+type defaultSettings struct {
+	streamSettings
+	TouchMode string `json:"touchMode"`
 }
 
 type streamSettings struct {
@@ -94,9 +102,20 @@ func (s *settingsStore) lookup(deviceID string) (scale float64, bitrate int) {
 			bitrate = v.Bitrate
 		}
 	}
-	apply(f.Defaults)
+	apply(f.Defaults.streamSettings)
 	if d, ok := f.Devices[deviceID]; ok {
 		apply(d.streamSettings)
 	}
 	return scale, bitrate
+}
+
+// touchMode returns how touches from a phone reach macOS. An unknown value in the file
+// is ignored (with a log line) rather than trusted.
+func (s *settingsStore) touchMode() input.Mode {
+	value := s.read().Defaults.TouchMode
+	mode, ok := input.ParseMode(value)
+	if !ok {
+		log.Printf("touch mode %q in the settings is not valid, using %q", value, mode)
+	}
+	return mode
 }
