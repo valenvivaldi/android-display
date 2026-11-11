@@ -10,11 +10,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.androidmac.client.R
 import com.androidmac.client.control.ControlClient
 import com.androidmac.client.touch.TouchEvent
@@ -146,14 +149,15 @@ class DisplayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
 
         // 註冊中斷廣播
-        registerReceiver(
+        ContextCompat.registerReceiver(
+            this,
             disconnectReceiver,
             IntentFilter(ACTION_DISCONNECT),
-            RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
     }
 
@@ -435,7 +439,7 @@ class DisplayService : Service() {
         Log.d(TAG, "Disconnecting...")
         disconnectCallback?.onDisconnected()
         cleanupConnections()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
@@ -460,6 +464,8 @@ class DisplayService : Service() {
     // ——— 通知相關 ———
 
     private fun createNotificationChannel() {
+        // Notification channels exist from Android 8 (API 26); older versions ignore the channel id.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,
             getString(R.string.notification_channel_name),

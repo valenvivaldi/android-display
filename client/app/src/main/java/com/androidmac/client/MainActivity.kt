@@ -152,7 +152,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra("height", serverHello.virtualDisplay.height)
                     putExtra("connectionType", connectionType)
                 }
-                startForegroundService(serviceIntent)
+                ContextCompat.startForegroundService(this@MainActivity, serviceIntent)
 
                 // 啟動 DisplayActivity
                 val displayIntent = Intent(this@MainActivity, DisplayActivity::class.java).apply {

@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
@@ -109,10 +110,13 @@ class DisplayActivity : AppCompatActivity() {
     }
 
     private fun enterImmersiveMode() {
-        window.insetsController?.let { controller ->
-            controller.hide(WindowInsets.Type.systemBars())
-            controller.systemBarsBehavior =
-                WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        // WindowInsetsController exists from Android 11 (API 30); older versions use the flags below.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.let { controller ->
+                controller.hide(WindowInsets.Type.systemBars())
+                controller.systemBarsBehavior =
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
         }
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = (

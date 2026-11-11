@@ -2,6 +2,7 @@ package com.androidmac.client.video
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -74,7 +75,13 @@ class VideoDecoder(
         format.setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
 
         codec = MediaCodec.createDecoderByType(MIME).apply {
-            setCallback(codecCallback, Handler(thread.looper))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                setCallback(codecCallback, Handler(thread.looper))
+            } else {
+                // setCallback(Callback, Handler) is API 23+. Before that the callbacks run on the
+                // calling thread's looper (the main thread here); they only feed and release buffers.
+                setCallback(codecCallback)
+            }
             configure(format, surface, null, 0)
             start()
         }
