@@ -5,27 +5,30 @@
 #include "encoder_bridge.h"
 #include <string.h>
 
-// EncoderContext holds the callback and user data for forwarding encoded NAL units.
+// EncoderContext holds the callback and user data for forwarding encoded NAL units, and the
+// buffer used to convert them. Every encoder has its own: with several phones connected,
+// each VideoToolbox session calls back on its own thread, and a buffer shared between them
+// let one phone's frame overwrite (or be freed under) another's, so phones received each
+// other's video.
 typedef struct {
     EncodedCallback callback;
     void *userData;
+    // Pre-allocated buffer for AVCC→Annex-B conversion to avoid per-NAL malloc/free.
+    // Only touched from this encoder's VideoToolbox callback thread.
+    uint8_t *annexBuf;
+    size_t annexBufCap;
 } EncoderContext;
 
 // Annex-B start code: 00 00 00 01
 static const uint8_t kStartCode[4] = {0x00, 0x00, 0x00, 0x01};
 
-// Pre-allocated buffer for AVCC→Annex-B conversion to avoid per-NAL malloc/free.
-// Only accessed from the VideoToolbox callback thread, so no synchronization needed.
-static uint8_t *sAnnexBuf = NULL;
-static size_t sAnnexBufCap = 0;
-
-static uint8_t *EnsureAnnexBuffer(size_t needed) {
-    if (sAnnexBufCap < needed) {
-        free(sAnnexBuf);
-        sAnnexBufCap = needed * 2; // double to reduce future reallocs
-        sAnnexBuf = (uint8_t *)malloc(sAnnexBufCap);
+static uint8_t *EnsureAnnexBuffer(EncoderContext *ctx, size_t needed) {
+    if (ctx->annexBufCap < needed) {
+        free(ctx->annexBuf);
+        ctx->annexBufCap = needed * 2; // double to reduce future reallocs
+        ctx->annexBuf = (uint8_t *)malloc(ctx->annexBufCap);
     }
-    return sAnnexBuf;
+    return ctx->annexBuf;
 }
 
 // outputCallback is invoked by VideoToolbox when a frame has been encoded.
@@ -80,7 +83,7 @@ static void outputCallback(void *outputCallbackRefCon,
 
                 // Send Annex-B formatted parameter set
                 size_t totalSize = 4 + paramSetSize;
-                uint8_t *buf = EnsureAnnexBuffer(totalSize);
+                uint8_t *buf = EnsureAnnexBuffer(ctx, totalSize);
                 if (buf) {
                     memcpy(buf, kStartCode, 4);
                     memcpy(buf + 4, paramSet, paramSetSize);
@@ -122,7 +125,7 @@ static void outputCallback(void *outputCallbackRefCon,
 
         // Build Annex-B formatted NAL unit: start code + data (reuse pre-allocated buffer)
         size_t annexBSize = 4 + nalLength;
-        uint8_t *buf = EnsureAnnexBuffer(annexBSize);
+        uint8_t *buf = EnsureAnnexBuffer(ctx, annexBSize);
         if (buf) {
             memcpy(buf, kStartCode, 4);
             memcpy(buf + 4, dataPointer + offset, nalLength);
@@ -267,6 +270,8 @@ void DestroyEncoder(void *session, void *context) {
         CFRelease((VTCompressionSessionRef)session);
     }
     if (context) {
-        free(context);
+        EncoderContext *ctx = (EncoderContext *)context;
+        free(ctx->annexBuf);
+        free(ctx);
     }
 }
