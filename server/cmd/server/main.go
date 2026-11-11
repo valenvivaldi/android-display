@@ -19,6 +19,7 @@ import (
 	"github.com/luke/android-mac/server/internal/discovery"
 	"github.com/luke/android-mac/server/internal/display"
 	"github.com/luke/android-mac/server/internal/encoder"
+	"github.com/luke/android-mac/server/internal/h264"
 	"github.com/luke/android-mac/server/internal/input"
 	"github.com/luke/android-mac/server/internal/stream"
 	"github.com/luke/android-mac/server/internal/touch"
@@ -316,9 +317,12 @@ func (srv *server) runPipeline(ctx context.Context, s *session, client control.C
 		Bitrate: bitrate,
 	}, func(nal encoder.NALUnit) {
 		var ft byte
+		data := nal.Data
 		switch {
 		case nal.NALType == 7:
 			ft = stream.FrameTypeSPS
+			// Tell decoders they never need to hold frames back; see h264.LimitDecoderBuffering.
+			data = h264.LimitDecoderBuffering(data)
 		case nal.NALType == 8:
 			ft = stream.FrameTypePPS
 		case nal.IsKeyframe:
@@ -331,10 +335,10 @@ func (srv *server) runPipeline(ctx context.Context, s *session, client control.C
 		sinceCapture := time.Duration(capture.NowMicros()-nal.Timestamp) * time.Microsecond
 		captureUnix := time.Now().Add(-sinceCapture).UnixMicro()
 		sendStart := time.Now()
-		if err := videoStreamer.SendFrame(nal.Data, ft, uint64(captureUnix)); err != nil {
+		if err := videoStreamer.SendFrame(data, ft, uint64(captureUnix)); err != nil {
 			s.logf("stream send error: %v", err)
 		}
-		stats.recordBytes(len(nal.Data))
+		stats.recordBytes(len(data))
 		if ft == stream.FrameTypeIDR || ft == stream.FrameTypeP {
 			stats.recordFrame(sinceCapture, time.Since(sendStart))
 		}
@@ -345,12 +349,25 @@ func (srv *server) runPipeline(ctx context.Context, s *session, client control.C
 	}
 	defer enc.Close()
 
+	// Re-send the last frame shortly after each change, so decoders that hold the newest
+	// frame until the next one arrives still show it (see frameFlusher). It owns the pixel
+	// buffers it is given. Deferred before cap.Stop and after enc.Close, so on the way out
+	// capture stops first, then the flusher, then the encoder.
+	flush := &frameFlusher{
+		encode:  enc.Encode,
+		release: capture.ReleasePixelBuffer,
+		now:     capture.NowMicros,
+		delay:   flushDelay,
+		repeats: flushRepeats,
+	}
+	defer flush.stop()
+
 	// Screen capture
 	cap, err := capture.Start(vd.DisplayID(), defaultFPS, func(frame capture.Frame) {
-		defer capture.ReleasePixelBuffer(frame.PixelBuffer)
 		if err := enc.Encode(frame.PixelBuffer, frame.Timestamp); err != nil {
 			s.logf("encode error: %v", err)
 		}
+		flush.hold(frame.PixelBuffer, frame.Timestamp)
 	})
 	if err != nil {
 		s.logf("capture error: %v", err)
