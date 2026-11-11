@@ -5,6 +5,7 @@ package protocol
 // streamed size and bitrate and reports them back in ServerHello.
 type ClientHello struct {
 	Device         string     `json:"device"`
+	DeviceID       string     `json:"deviceId,omitempty"` // stable per-phone id (Android ID); keys the display identity and saved position
 	Screen         ScreenInfo `json:"screen"`
 	Capabilities   []string   `json:"capabilities"`
 	Codecs         []string   `json:"codecs"`
@@ -24,6 +25,7 @@ type ScreenInfo struct {
 
 // ServerHello is sent by Mac to Android in response
 type ServerHello struct {
+	SessionID      uint32      `json:"sessionId"` // the phone sends it (4 bytes, big-endian) first on its touch and video connections
 	VirtualDisplay DisplayInfo `json:"virtualDisplay"`
 	Codec          string      `json:"codec"`
 	Bitrate        int         `json:"bitrate"`

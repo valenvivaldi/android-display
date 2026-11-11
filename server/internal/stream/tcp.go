@@ -1,8 +1,11 @@
 package stream
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -22,21 +25,19 @@ var framePool = sync.Pool{
 	},
 }
 
-// TCPVideoServer streams H.264 NAL units over TCP with length-prefix framing.
+// SessionHeaderSize is the size of the session ID a phone sends right after
+// connecting to the video port: the sessionId from ServerHello (uint32, big-endian).
+const SessionHeaderSize = 4
+
+// TCPVideoServer accepts the video connections of any number of phones.
 // Used for USB connections where ADB only supports TCP tunneling.
 //
-// Wire format per frame:
-//
-//	[4 bytes: total packet length (big-endian)] [17 bytes: packet header] [payload]
-//
-// Unlike UDP, TCP does not fragment — each NAL is sent as a single "packet"
-// with fragIndex=0, fragTotal=1. The 4-byte length prefix provides message
-// framing on the TCP stream.
+// Every phone connects to the same port and identifies its session with a
+// 4-byte header; Accept hands the connection to the session that owns it.
 type TCPVideoServer struct {
 	listener net.Listener
-	conn     net.Conn
 	mu       sync.Mutex
-	sequence atomic.Uint32
+	slots    map[uint32]chan net.Conn
 	done     chan struct{}
 }
 
@@ -49,6 +50,7 @@ func NewTCPVideoServer(port int) (*TCPVideoServer, error) {
 	}
 	return &TCPVideoServer{
 		listener: ln,
+		slots:    make(map[uint32]chan net.Conn),
 		done:     make(chan struct{}),
 	}, nil
 }
@@ -58,23 +60,110 @@ func (s *TCPVideoServer) Port() int {
 	return s.listener.Addr().(*net.TCPAddr).Port
 }
 
-// AcceptOne blocks until a single client connects.
-// Only one client is supported at a time.
-func (s *TCPVideoServer) AcceptOne() error {
-	conn, err := s.listener.Accept()
-	if err != nil {
-		return err
+// slot returns the channel on which the session's connection is delivered,
+// creating it if needed. Either side may get there first: the phone can
+// connect before the pipeline calls Accept.
+func (s *TCPVideoServer) slot(session uint32) chan net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.slots[session]
+	if !ok {
+		ch = make(chan net.Conn, 1)
+		s.slots[session] = ch
 	}
+	return ch
+}
+
+// AcceptLoop accepts connections and routes them to their sessions. Run it in a goroutine.
+func (s *TCPVideoServer) AcceptLoop() {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			select {
+			case <-s.done:
+				return
+			default:
+				log.Printf("video accept error: %v", err)
+				continue
+			}
+		}
+		go s.route(conn)
+	}
+}
+
+func (s *TCPVideoServer) route(conn net.Conn) {
+	var header [SessionHeaderSize]byte
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		log.Printf("video session header read error: %v", err)
+		conn.Close()
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+	session := binary.BigEndian.Uint32(header[:])
+
 	// Set TCP_NODELAY for low latency
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetWriteBuffer(4 * 1024 * 1024) // 4MB for 8Mbps@60fps headroom
 	}
-	s.mu.Lock()
-	s.conn = conn
-	s.mu.Unlock()
-	log.Printf("TCP video client connected from %s", conn.RemoteAddr())
-	return nil
+
+	select {
+	case s.slot(session) <- conn:
+	default:
+		log.Printf("video: session %d connected twice, closing the extra connection", session)
+		conn.Close()
+	}
+}
+
+// Accept waits until the session's phone has connected to the video port.
+func (s *TCPVideoServer) Accept(ctx context.Context, session uint32, timeout time.Duration) (*TCPVideoStream, error) {
+	ch := s.slot(session)
+	defer func() {
+		s.mu.Lock()
+		delete(s.slots, session)
+		s.mu.Unlock()
+	}()
+
+	select {
+	case conn := <-ch:
+		log.Printf("session %d: TCP video client connected from %s", session, conn.RemoteAddr())
+		return &TCPVideoStream{conn: conn}, nil
+	case <-ctx.Done():
+		drain(ch)
+		return nil, ctx.Err()
+	case <-time.After(timeout):
+		drain(ch)
+		return nil, errors.New("timed out waiting for the phone's video connection")
+	}
+}
+
+func drain(ch chan net.Conn) {
+	select {
+	case conn := <-ch:
+		conn.Close()
+	default:
+	}
+}
+
+// Close stops accepting new connections. Established streams are closed by their sessions.
+func (s *TCPVideoServer) Close() error {
+	close(s.done)
+	return s.listener.Close()
+}
+
+// TCPVideoStream streams H.264 NAL units of one session over TCP with length-prefix framing.
+//
+// Wire format per frame:
+//
+//	[4 bytes: total packet length (big-endian)] [17 bytes: packet header] [payload]
+//
+// Unlike UDP, TCP does not fragment — each NAL is sent as a single "packet"
+// with fragIndex=0, fragTotal=1. The 4-byte length prefix provides message
+// framing on the TCP stream.
+type TCPVideoStream struct {
+	conn     net.Conn
+	sequence atomic.Uint32
 }
 
 // SendFrame sends a NAL unit as a single length-prefixed TCP message.
@@ -84,15 +173,7 @@ func (s *TCPVideoServer) AcceptOne() error {
 // Optimized for zero per-frame heap allocations:
 //   - Frame buffer is recycled via sync.Pool
 //   - Header is serialized inline (no PacketHeader struct or Marshal call)
-func (s *TCPVideoServer) SendFrame(nalUnit []byte, frameType byte, captureMicros uint64) error {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
-
-	if conn == nil {
-		return fmt.Errorf("no TCP video client connected")
-	}
-
+func (s *TCPVideoStream) SendFrame(nalUnit []byte, frameType byte, captureMicros uint64) error {
 	seq := s.sequence.Add(1)
 	timestamp := captureMicros
 
@@ -133,8 +214,8 @@ func (s *TCPVideoServer) SendFrame(nalUnit []byte, frameType byte, captureMicros
 	copy(buf[4+PacketHeaderSize:], nalUnit)
 
 	// Set write deadline to avoid blocking on slow clients
-	conn.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
-	_, err := conn.Write(buf)
+	s.conn.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+	_, err := s.conn.Write(buf)
 
 	// Return buffer to pool — must update the pointer in case we grew it
 	*bufp = buf
@@ -151,14 +232,7 @@ func (s *TCPVideoServer) SendFrame(nalUnit []byte, frameType byte, captureMicros
 	return nil
 }
 
-// Close stops the server and closes all connections.
-func (s *TCPVideoServer) Close() error {
-	close(s.done)
-	s.mu.Lock()
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-	s.mu.Unlock()
-	return s.listener.Close()
+// Close closes the connection to the phone.
+func (s *TCPVideoStream) Close() error {
+	return s.conn.Close()
 }

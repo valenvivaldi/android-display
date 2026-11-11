@@ -11,7 +11,15 @@ private let scaleOptions: [Double] = [1.0, 0.9, 0.75, 0.6, 0.5]
 private let bitrateOptions: [Int] = [12_000_000, 8_000_000, 6_000_000, 4_000_000, 2_000_000, 1_000_000]
 
 enum ServerState {
-    case stopped, waiting, connected
+    case stopped, running
+}
+
+/// One connected phone, as reported by the server's "session N: …" log lines.
+struct PhoneSession: Identifiable, Equatable {
+    let id: Int
+    var device: String
+    var streamSize: String?
+    var isStreaming = false
 }
 
 struct ServerConfig: Equatable {
@@ -25,10 +33,11 @@ final class ServerController: ObservableObject {
 
     @Published private(set) var state: ServerState = .stopped
     @Published private(set) var running: ServerConfig?
-    @Published private(set) var device: String?
+    @Published private(set) var sessions: [PhoneSession] = []
+    /// Native screen size of the most recently connected phone; used to preview the pixel sizes.
     @Published private(set) var nativeSize: (width: Int, height: Int)?
-    @Published private(set) var streamSize: String?
-    @Published private(set) var noAdbDevice = false
+    /// Serials of the phones adb currently sees; the server forwards their ports as they appear.
+    @Published private(set) var usbDevices: Set<String> = []
     @Published private(set) var error: String?
 
     let logURL = FileManager.default.homeDirectoryForCurrentUser
@@ -98,7 +107,7 @@ final class ServerController: ObservableObject {
         outputPipe = output
         running = config
         error = nil
-        state = .waiting
+        state = .running
     }
 
     /// Stops the server and waits (up to ~3 s) for it to clean up its adb forwards.
@@ -131,8 +140,8 @@ final class ServerController: ObservableObject {
         outputPipe = nil
         running = nil
         state = .stopped
-        device = nil
-        streamSize = nil
+        sessions = []
+        usbDevices = []
         lineBuffer.removeAll()
     }
 
@@ -157,22 +166,24 @@ final class ServerController: ObservableObject {
 
     private func handle(line: String) {
         if line.contains("control server on port") {
-            state = .waiting
-        } else if let m = line.firstMatch(of: /client connected: (.+) \((\d+)x(\d+)\)/) {
-            device = String(m.1)
-            nativeSize = (Int(m.2) ?? 0, Int(m.3) ?? 0)
-        } else if let m = line.firstMatch(of: /stream config: (\d+)x(\d+)/) {
-            streamSize = "\(m.1)×\(m.2)"
-        } else if line.contains("pipeline active") {
-            state = .connected
+            state = .running
+        } else if let m = line.firstMatch(of: /session (\d+): client connected: (.+) \((\d+)x(\d+)\)/) {
+            let id = Int(m.1) ?? 0
+            sessions.removeAll { $0.id == id }
+            sessions.append(PhoneSession(id: id, device: String(m.2)))
+            nativeSize = (Int(m.3) ?? 0, Int(m.4) ?? 0)
+        } else if let m = line.firstMatch(of: /session (\d+): stream config: (\d+)x(\d+)/) {
+            update(session: Int(m.1) ?? 0) { $0.streamSize = "\(m.2)×\(m.3)" }
+        } else if let m = line.firstMatch(of: /session (\d+): pipeline active/) {
+            update(session: Int(m.1) ?? 0) { $0.isStreaming = true }
             error = nil
-        } else if line.contains("client disconnected") || line.contains("pipeline stopping") {
-            state = .waiting
-            streamSize = nil
-        } else if line.contains("ADB available but no device connected") {
-            noAdbDevice = true
-        } else if line.contains("ADB reverse forwarding enabled") {
-            noAdbDevice = false
+        } else if let m = line.firstMatch(of: /session (\d+): (client disconnected|pipeline stopping)/) {
+            let id = Int(m.1) ?? 0
+            sessions.removeAll { $0.id == id }
+        } else if let m = line.firstMatch(of: /adb device connected: (\S+)/) {
+            usbDevices.insert(String(m.1))
+        } else if let m = line.firstMatch(of: /adb device disconnected: (\S+)/) {
+            usbDevices.remove(String(m.1))
         } else if line.contains("address already in use") {
             error = "El puerto 9000 está ocupado: hay otro servidor corriendo."
         } else if line.contains("capture error") {
@@ -180,6 +191,11 @@ final class ServerController: ObservableObject {
         } else if line.contains("virtual display error") || line.contains("encoder error") {
             error = "Falló el pipeline de video. Revisá el log."
         }
+    }
+
+    private func update(session id: Int, _ change: (inout PhoneSession) -> Void) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        change(&sessions[index])
     }
 }
 
@@ -225,13 +241,13 @@ struct ContentView: View {
                 Picker("Resolución", selection: $scale) {
                     ForEach(scaleOptions, id: \.self) { Text(scaleLabel($0)).tag($0) }
                 }
-                Picker("Calidad", selection: $bitrate) {
+                Picker("Calidad (por celular)", selection: $bitrate) {
                     ForEach(bitrateOptions, id: \.self) { Text(bitrateLabel($0)).tag($0) }
                 }
             }
 
             if hasPendingChanges {
-                Text("Los cambios se aplican al reiniciar el servidor. El celular se desconecta: tocá Conectar de nuevo.")
+                Text("Los cambios se aplican al reiniciar el servidor. Los celulares se desconectan: tocá Conectar de nuevo en cada uno.")
                     .font(.callout)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
@@ -273,14 +289,18 @@ struct ContentView: View {
             if let detail = statusDetail {
                 Text(detail).font(.callout).foregroundStyle(.secondary)
             }
+            ForEach(server.sessions) { phone in
+                HStack(spacing: 6) {
+                    Circle().fill(phone.isStreaming ? Color.green : Color.orange).frame(width: 7, height: 7)
+                    Text(phone.device)
+                    if let size = phone.streamSize {
+                        Text(size).foregroundStyle(.secondary)
+                    }
+                }
+                .font(.callout)
+            }
             if let error = server.error {
                 Text(error).font(.callout).foregroundStyle(.red)
-            }
-            if server.noAdbDevice {
-                Text("No había celular por USB al iniciar. Conectalo y tocá Aplicar y reiniciar para habilitar USB.")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -307,29 +327,25 @@ struct ContentView: View {
     }
 
     private var statusColor: Color {
-        switch server.state {
-        case .stopped: return .gray
-        case .waiting: return .orange
-        case .connected: return .green
-        }
+        if server.state == .stopped { return .gray }
+        return server.sessions.contains(where: \.isStreaming) ? .green : .orange
     }
 
     private var statusTitle: String {
-        switch server.state {
-        case .stopped: return "Servidor detenido"
-        case .waiting: return "Esperando al celular…"
-        case .connected: return "Conectado" + (server.device.map { ": \($0)" } ?? "")
+        guard server.state == .running else { return "Servidor detenido" }
+        switch server.sessions.count {
+        case 0: return "Esperando celulares…"
+        case 1: return "1 celular conectado"
+        default: return "\(server.sessions.count) celulares conectados"
         }
     }
 
     private var statusDetail: String? {
         guard let running = server.running else { return nil }
-        var parts: [String] = []
-        if server.state == .connected, let size = server.streamSize {
-            parts.append(size)
+        var parts = ["\(Int(running.scale * 100)) %", bitrateLabel(running.bitrate)]
+        if !server.usbDevices.isEmpty {
+            parts.append("USB: \(server.usbDevices.count) detectado\(server.usbDevices.count == 1 ? "" : "s")")
         }
-        parts.append("\(Int(running.scale * 100)) %")
-        parts.append(bitrateLabel(running.bitrate))
         return parts.joined(separator: " · ")
     }
 
