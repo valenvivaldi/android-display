@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,9 @@ type server struct {
 	touch   *touch.Server
 	video   *stream.TCPVideoServer
 	origins *originStore
+
+	mu      sync.Mutex
+	clients map[uint32]control.ClientConn // live sessions by id, for commands from the Mac app
 }
 
 func main() {
@@ -130,8 +134,9 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	if *exitOnStdinEOF {
+		// The Mac app owns our stdin: it sends commands as lines, and closing it means "exit".
 		go func() {
-			io.Copy(io.Discard, os.Stdin)
+			srv.runCommands(os.Stdin)
 			sig <- syscall.SIGTERM
 		}()
 	}
@@ -156,6 +161,11 @@ func (srv *server) startSession(client control.ClientConn) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	srv.track(s.id, client)
+	go func() {
+		<-ctx.Done()
+		srv.untrack(s.id)
+	}()
 
 	// Monitor the TCP control connection
 	go func() {

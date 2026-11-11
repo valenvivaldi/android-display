@@ -1,6 +1,7 @@
 package com.androidmac.client
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -22,6 +23,7 @@ import com.androidmac.client.service.DisplayService
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 
@@ -31,6 +33,21 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "MainActivity"
         private const val DEFAULT_PORT = 9000
         private const val NOTIFICATION_PERMISSION_CODE = 1001
+        private const val EXTRA_RECONNECT = "reconnect"
+        private const val EXTRA_HOST = "host"
+        private const val EXTRA_CONNECTION_TYPE = "connectionType"
+
+        // Gives the Mac time to end the old session (and release its display) before the new handshake.
+        private const val RECONNECT_DELAY_MS = 800L
+
+        /** Brings the connect screen forward and makes it connect again with the same connection type. */
+        fun reconnectIntent(context: Context, host: String, connectionType: String): Intent =
+            Intent(context, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                putExtra(EXTRA_RECONNECT, true)
+                putExtra(EXTRA_HOST, host)
+                putExtra(EXTRA_CONNECTION_TYPE, connectionType)
+            }
     }
 
     private lateinit var statusText: TextView
@@ -79,6 +96,29 @@ class MainActivity : AppCompatActivity() {
         requestNotificationPermission()
 
         startDiscovery()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        reconnectIfRequested(intent)
+    }
+
+    /** Selects the same connection type as before and taps Connect, when the Mac asked for a reconnect. */
+    private fun reconnectIfRequested(intent: Intent) {
+        if (!intent.getBooleanExtra(EXTRA_RECONNECT, false)) return
+        intent.removeExtra(EXTRA_RECONNECT) // a recreated activity must not reconnect again
+        statusText.text = "Reconectando..."
+        if (intent.getStringExtra(EXTRA_CONNECTION_TYPE) == "usb") {
+            connectionMode.check(R.id.modeUsb)
+        } else {
+            connectionMode.check(R.id.modeWifi)
+            manualIpInput.setText(intent.getStringExtra(EXTRA_HOST) ?: "")
+        }
+        lifecycleScope.launch {
+            delay(RECONNECT_DELAY_MS)
+            onConnectClicked()
+        }
     }
 
     private fun requestNotificationPermission() {

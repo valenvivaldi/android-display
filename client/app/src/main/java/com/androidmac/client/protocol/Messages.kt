@@ -66,6 +66,19 @@ data class ServerHello(
     }
 }
 
+/** A message the Mac sends on the control channel after the handshake (one JSON object per line). */
+object ServerMessage {
+    /** The Mac asks this phone to disconnect and connect again, so new settings take effect. */
+    const val RECONNECT = "reconnect"
+
+    /** The message's type, or "" when the line is not a JSON object with a type. */
+    fun typeOf(line: String): String = try {
+        JSONObject(line).optString("type")
+    } catch (_: Exception) {
+        ""
+    }
+}
+
 /** First 4 bytes (big-endian) on the touch and video connections; routes them to this phone's session. */
 fun sessionHeader(sessionId: Long): ByteArray =
     ByteBuffer.allocate(4).putInt(sessionId.toInt()).array() // ByteBuffer is big-endian by default

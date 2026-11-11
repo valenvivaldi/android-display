@@ -23,6 +23,11 @@ type ClientConn struct {
 	Bitrate int
 }
 
+// RequestReconnect asks the phone to disconnect and connect again by itself.
+func (c ClientConn) RequestReconnect() error {
+	return json.NewEncoder(c.Conn).Encode(protocol.ServerMessage{Type: protocol.MessageReconnect})
+}
+
 // StreamSettings picks the streamed resolution (scale of the phone's native screen) and
 // bitrate for a phone, given its device id. The server defaults apply when it is nil.
 type StreamSettings func(deviceID string) (scale float64, bitrate int)
