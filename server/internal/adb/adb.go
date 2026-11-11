@@ -1,12 +1,14 @@
 package adb
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Manager handles ADB device detection and reverse port forwarding
@@ -51,54 +53,105 @@ func (m *Manager) Path() string {
 	return m.adbPath
 }
 
-// HasDevice returns true if at least one ADB device is connected.
-func (m *Manager) HasDevice() bool {
+// Devices returns the serials of the authorized devices currently attached.
+func (m *Manager) Devices() ([]string, error) {
 	out, err := exec.Command(m.adbPath, "devices").Output()
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("adb devices failed: %v", err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	// First line is "List of devices attached", actual devices follow
-	for _, line := range lines[1:] {
-		line = strings.TrimSpace(line)
-		if line != "" && strings.Contains(line, "\tdevice") {
-			return true
+	return parseDevices(string(out)), nil
+}
+
+// parseDevices extracts the serials in the "device" state from `adb devices` output.
+// Unauthorized and offline devices, the header and daemon start-up messages are skipped.
+func parseDevices(out string) []string {
+	var serials []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == "device" {
+			serials = append(serials, fields[0])
 		}
 	}
-	return false
+	return serials
 }
 
-// SetupReverse creates a reverse port forwarding: Android localhost:port → Mac localhost:port.
+// SetupReverse creates a reverse port forwarding on one device: its localhost:port → Mac localhost:port.
 // This allows the Android app to connect to localhost:port and reach the Mac server.
-func (m *Manager) SetupReverse(port int) error {
+func (m *Manager) SetupReverse(serial string, port int) error {
 	portStr := fmt.Sprintf("tcp:%d", port)
-	cmd := exec.Command(m.adbPath, "reverse", portStr, portStr)
-	out, err := cmd.CombinedOutput()
+	out, err := exec.Command(m.adbPath, "-s", serial, "reverse", portStr, portStr).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("adb reverse %s failed: %v (%s)", portStr, err, strings.TrimSpace(string(out)))
-	}
-	log.Printf("adb reverse %s → %s", portStr, portStr)
-	return nil
-}
-
-// RemoveReverse removes a single reverse forwarding rule.
-func (m *Manager) RemoveReverse(port int) error {
-	portStr := fmt.Sprintf("tcp:%d", port)
-	cmd := exec.Command(m.adbPath, "reverse", "--remove", portStr)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("adb reverse --remove %s failed: %v (%s)", portStr, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("adb -s %s reverse %s failed: %v (%s)", serial, portStr, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-// RemoveAllReverse removes all reverse forwarding rules.
-func (m *Manager) RemoveAllReverse() error {
-	cmd := exec.Command(m.adbPath, "reverse", "--remove-all")
-	out, err := cmd.CombinedOutput()
+// RemoveAllReverse removes all reverse forwarding rules on one device.
+func (m *Manager) RemoveAllReverse(serial string) error {
+	out, err := exec.Command(m.adbPath, "-s", serial, "reverse", "--remove-all").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("adb reverse --remove-all failed: %v (%s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("adb -s %s reverse --remove-all failed: %v (%s)", serial, err, strings.TrimSpace(string(out)))
 	}
-	log.Println("adb reverse --remove-all")
 	return nil
+}
+
+// Watch keeps USB forwarding set up for every attached device until ctx is done:
+// phones plugged in later get their ports forwarded within one interval, and the
+// rules are removed again from every device it set up when ctx ends.
+func (m *Manager) Watch(ctx context.Context, ports []int, interval time.Duration) {
+	known := make(map[string]bool)
+	defer func() {
+		for serial := range known {
+			if err := m.RemoveAllReverse(serial); err != nil {
+				log.Printf("adb cleanup: %v", err)
+			}
+		}
+	}()
+
+	for {
+		m.syncDevices(ports, known)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+func (m *Manager) syncDevices(ports []int, known map[string]bool) {
+	serials, err := m.Devices()
+	if err != nil {
+		log.Printf("adb: %v", err)
+		return
+	}
+
+	present := make(map[string]bool, len(serials))
+	for _, serial := range serials {
+		present[serial] = true
+		if known[serial] {
+			continue
+		}
+		// Clear stale rules from a previous run, then forward every port.
+		if err := m.RemoveAllReverse(serial); err != nil {
+			log.Printf("adb: %v", err)
+		}
+		ok := true
+		for _, port := range ports {
+			if err := m.SetupReverse(serial, port); err != nil {
+				log.Printf("adb: %v", err)
+				ok = false
+				break
+			}
+		}
+		if ok {
+			known[serial] = true
+			log.Printf("adb device connected: %s (USB forwarding enabled)", serial)
+		}
+	}
+	for serial := range known {
+		if !present[serial] {
+			delete(known, serial)
+			log.Printf("adb device disconnected: %s", serial)
+		}
+	}
 }

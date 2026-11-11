@@ -1,5 +1,6 @@
 package com.androidmac.client.touch
 
+import com.androidmac.client.protocol.sessionHeader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.OutputStream
@@ -9,11 +10,15 @@ class TouchSender {
     private var socket: Socket? = null
     private var output: OutputStream? = null
 
-    suspend fun connect(host: String, port: Int) = withContext(Dispatchers.IO) {
+    /** Connects and identifies this phone's session so the Mac routes the events to its display. */
+    suspend fun connect(host: String, port: Int, sessionId: Long) = withContext(Dispatchers.IO) {
         socket = Socket(host, port).also {
             it.tcpNoDelay = true
             // Direct output stream — no BufferedOutputStream since we flush every write.
-            output = it.getOutputStream()
+            output = it.getOutputStream().also { out ->
+                out.write(sessionHeader(sessionId))
+                out.flush()
+            }
         }
     }
 

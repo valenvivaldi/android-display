@@ -2,6 +2,7 @@ package com.androidmac.client.protocol
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.ByteBuffer
 
 data class ScreenInfo(val width: Int, val height: Int, val dpi: Int)
 
@@ -10,11 +11,16 @@ data class ClientHello(
     val screen: ScreenInfo,
     val capabilities: List<String>,
     val codecs: List<String>,
-    val connectionType: String = "wifi"
+    val connectionType: String = "wifi",
+    /** Stable per-phone id (Android ID). The Mac keys the display's identity and saved position on it. */
+    val deviceId: String = ""
 ) {
     fun toJson(): String {
         val obj = JSONObject()
         obj.put("device", device)
+        if (deviceId.isNotEmpty()) {
+            obj.put("deviceId", deviceId)
+        }
         obj.put("screen", JSONObject().apply {
             put("width", screen.width)
             put("height", screen.height)
@@ -32,6 +38,8 @@ data class ClientHello(
 data class DisplayInfo(val width: Int, val height: Int)
 
 data class ServerHello(
+    /** Identifies this phone on the Mac; sent first on the touch and video connections (see [sessionHeader]). */
+    val sessionId: Long,
     val virtualDisplay: DisplayInfo,
     val codec: String,
     val bitrate: Int,
@@ -45,6 +53,7 @@ data class ServerHello(
             val obj = JSONObject(json)
             val disp = obj.getJSONObject("virtualDisplay")
             return ServerHello(
+                sessionId = obj.optLong("sessionId", 0),
                 virtualDisplay = DisplayInfo(disp.getInt("width"), disp.getInt("height")),
                 codec = obj.getString("codec"),
                 bitrate = obj.getInt("bitrate"),
@@ -56,6 +65,10 @@ data class ServerHello(
         }
     }
 }
+
+/** First 4 bytes (big-endian) on the touch and video connections; routes them to this phone's session. */
+fun sessionHeader(sessionId: Long): ByteArray =
+    ByteBuffer.allocate(4).putInt(sessionId.toInt()).array() // ByteBuffer is big-endian by default
 
 data class ClientReady(val udpPort: Int) {
     fun toJson(): String {

@@ -1,6 +1,7 @@
 package com.androidmac.client.video
 
 import android.util.Log
+import com.androidmac.client.protocol.sessionHeader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -17,7 +18,7 @@ import java.net.Socket
  * 由於 TCP 保證順序和完整性，不需要分片重組 —
  * 每個封包都是完整的 NAL unit（fragIndex=0, fragTotal=1）。
  */
-class TcpVideoReceiver(private val host: String, private val port: Int) {
+class TcpVideoReceiver(private val host: String, private val port: Int, private val sessionId: Long) {
 
     companion object {
         private const val TAG = "TcpVideoReceiver"
@@ -27,15 +28,19 @@ class TcpVideoReceiver(private val host: String, private val port: Int) {
     private var input: DataInputStream? = null
 
     /**
-     * 建立 TCP 連線到 server video port。
+     * 建立 TCP 連線到 server video port，並先送出 session header，讓 server 把連線交給這支手機的 session。
      */
     suspend fun connect() = withContext(Dispatchers.IO) {
         val sock = Socket(host, port)
         sock.tcpNoDelay = true
         sock.receiveBufferSize = 4 * 1024 * 1024 // match server write buffer
+        sock.getOutputStream().apply {
+            write(sessionHeader(sessionId))
+            flush()
+        }
         socket = sock
         input = DataInputStream(BufferedInputStream(sock.getInputStream(), 256 * 1024))
-        Log.d(TAG, "Connected to $host:$port")
+        Log.d(TAG, "Connected to $host:$port (session $sessionId)")
     }
 
     /**

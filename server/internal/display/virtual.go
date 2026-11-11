@@ -36,6 +36,8 @@ type Config struct {
 	Height int
 	PPI    int
 	HiDPI  bool
+	Serial uint32 // identity of the display; use a non-zero value that is stable per phone
+	Name   string // shown in System Settings → Displays
 }
 
 // New creates a new virtual display with the given configuration.
@@ -45,9 +47,17 @@ func New(cfg Config) (*VirtualDisplay, error) {
 		width:  C.int(cfg.Width),
 		height: C.int(cfg.Height),
 		ppi:    C.int(cfg.PPI),
+		serial: C.uint(cfg.Serial),
 	}
 	if cfg.HiDPI {
 		ccfg.hiDPI = 1
+	}
+	name := []byte(cfg.Name)
+	if len(name) > len(ccfg.name)-1 {
+		name = name[:len(ccfg.name)-1]
+	}
+	for i, b := range name {
+		ccfg.name[i] = C.char(b)
 	}
 
 	result := C.CreateVirtualDisplay(ccfg)

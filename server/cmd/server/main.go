@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -28,17 +27,23 @@ const (
 	controlPort    = 9000
 	defaultFPS     = 60
 	defaultBitrate = 8_000_000
+
+	// adbPollInterval is how often attached phones are checked for USB forwarding.
+	adbPollInterval = 2 * time.Second
+	// videoConnectTimeout is how long a USB phone has to open its video connection.
+	videoConnectTimeout = 10 * time.Second
 )
 
-// adbManager is set up at startup if ADB is available.
-var adbManager *adb.Manager
-
-// tcpVideoServer is always started for USB mode support.
-var tcpVideoServer *stream.TCPVideoServer
+// server holds what every session shares. Each phone gets its own session on top of it.
+type server struct {
+	touch   *touch.Server
+	video   *stream.TCPVideoServer
+	origins *originStore
+}
 
 func main() {
 	scale := flag.Float64("scale", 1.0, "streamed resolution as a fraction of the device's native screen (0.25-1)")
-	bitrate := flag.Int("bitrate", defaultBitrate, "video bitrate in bits per second")
+	bitrate := flag.Int("bitrate", defaultBitrate, "video bitrate in bits per second, per phone")
 	exitOnStdinEOF := flag.Bool("exit-on-stdin-eof", false, "shut down when stdin closes (set by the Mac app so the server dies with it)")
 	flag.Parse()
 	if *scale < 0.25 || *scale > 1 {
@@ -50,7 +55,7 @@ func main() {
 
 	log.Println("android-mac server starting...")
 
-	// 1. Start touch TCP server (auto-assign port)
+	// 1. Touch server shared by all phones (auto-assign port); events are routed by session
 	touchServer, err := touch.NewServer(0)
 	if err != nil {
 		log.Fatalf("touch server failed: %v", err)
@@ -59,35 +64,34 @@ func main() {
 	go touchServer.AcceptLoop()
 	log.Printf("touch server on port %d", touchServer.Port())
 
-	// 2. Start TCP video server for USB mode (auto-assign port)
-	tcpVideoServer, err = stream.NewTCPVideoServer(0)
+	// 2. TCP video server for USB mode, shared by all phones (auto-assign port)
+	videoServer, err := stream.NewTCPVideoServer(0)
 	if err != nil {
 		log.Fatalf("TCP video server failed: %v", err)
 	}
-	defer tcpVideoServer.Close()
-	log.Printf("TCP video server on port %d", tcpVideoServer.Port())
+	defer videoServer.Close()
+	go videoServer.AcceptLoop()
+	log.Printf("TCP video server on port %d", videoServer.Port())
 
-	// 3. Set up ADB reverse forwarding if device is connected
-	adbManager, err = adb.NewManager()
+	origins, err := defaultOriginStore()
+	if err != nil {
+		log.Fatalf("display position store: %v", err)
+	}
+	srv := &server{touch: touchServer, video: videoServer, origins: origins}
+
+	// 3. Forward the ports to every USB phone, now and whenever one is plugged in later
+	adbCtx, stopADB := context.WithCancel(context.Background())
+	adbDone := make(chan struct{})
+	adbManager, err := adb.NewManager()
 	if err != nil {
 		log.Printf("ADB not available: %v (USB connections disabled)", err)
-	} else if adbManager.HasDevice() {
-		// Clean up any stale reverse forwarding from previous runs
-		adbManager.RemoveAllReverse()
-
-		// Set up reverse forwarding for all ports
-		if err := adbManager.SetupReverse(controlPort); err != nil {
-			log.Printf("ADB reverse control port failed: %v", err)
-		}
-		if err := adbManager.SetupReverse(touchServer.Port()); err != nil {
-			log.Printf("ADB reverse touch port failed: %v", err)
-		}
-		if err := adbManager.SetupReverse(tcpVideoServer.Port()); err != nil {
-			log.Printf("ADB reverse video port failed: %v", err)
-		}
-		log.Println("ADB reverse forwarding enabled (USB connections ready)")
+		close(adbDone)
 	} else {
-		log.Println("ADB available but no device connected")
+		ports := []int{controlPort, touchServer.Port(), videoServer.Port()}
+		go func() {
+			defer close(adbDone)
+			adbManager.Watch(adbCtx, ports, adbPollInterval)
+		}()
 	}
 
 	// 4. Start mDNS advertisement
@@ -106,40 +110,10 @@ func main() {
 	}
 	defer ctrlServer.Stop()
 	ctrlServer.SetTouchPort(touchServer.Port())
-	ctrlServer.SetVideoPort(tcpVideoServer.Port())
+	ctrlServer.SetVideoPort(videoServer.Port())
 
-	// 6. On client connect → start the capture-encode-stream pipeline
-	ctrlServer.OnClient(func(client control.ClientConn) {
-		w, h, bitrate := client.Width, client.Height, client.Bitrate
-
-		ctx, cancel := context.WithCancel(context.Background())
-
-		// Monitor the TCP control connection
-		go func() {
-			buf := make([]byte, 1)
-			for {
-				_, err := client.Conn.Read(buf)
-				if err != nil {
-					if err != io.EOF {
-						log.Printf("control connection read error: %v", err)
-					}
-					log.Println("client disconnected, cancelling pipeline")
-					cancel()
-					return
-				}
-			}
-		}()
-
-		// Determine video transport based on connection type
-		if client.Hello.IsUSB() {
-			go startPipelineUSB(ctx, cancel, w, h, bitrate, touchServer)
-		} else {
-			remoteAddr := client.Conn.RemoteAddr().String()
-			host, _, _ := net.SplitHostPort(remoteAddr)
-			targetAddr := fmt.Sprintf("%s:%d", host, client.UDPPort)
-			go startPipelineWiFi(ctx, cancel, w, h, bitrate, targetAddr, touchServer)
-		}
-	})
+	// 6. Every client that connects gets its own capture-encode-stream pipeline
+	ctrlServer.OnClient(srv.startSession)
 
 	go ctrlServer.AcceptLoop()
 	log.Printf("control server on port %d — waiting for connections...", controlPort)
@@ -156,70 +130,115 @@ func main() {
 	<-sig
 	log.Println("shutting down...")
 
-	// Clean up ADB reverse forwarding
-	if adbManager != nil {
-		adbManager.RemoveAllReverse()
+	// Remove the ADB reverse forwarding from every phone
+	stopADB()
+	select {
+	case <-adbDone:
+	case <-time.After(5 * time.Second):
+		log.Println("timed out removing ADB forwarding")
 	}
 }
 
-// startPipelineWiFi starts the capture-encode-stream pipeline using UDP transport.
-func startPipelineWiFi(ctx context.Context, cancel context.CancelFunc, width, height, bitrate int, targetAddr string, touchServer *touch.Server) {
-	defer cancel()
-	log.Printf("starting WiFi pipeline: %dx%d @ %d bps → %s", width, height, bitrate, targetAddr)
+// startSession runs one phone's pipeline until its control connection closes.
+func (srv *server) startSession(client control.ClientConn) {
+	s := &session{id: client.SessionID, deviceID: client.Hello.DeviceID, name: client.Hello.Device}
+	if s.deviceID == "" {
+		// Older clients don't send an id; the model is the best stable key left.
+		s.deviceID = client.Hello.Device
+	}
 
-	// UDP streamer
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Monitor the TCP control connection
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			_, err := client.Conn.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					s.logf("control connection read error: %v", err)
+				}
+				s.logf("client disconnected, cancelling pipeline")
+				cancel()
+				return
+			}
+		}
+	}()
+
+	// Determine video transport based on connection type
+	if client.Hello.IsUSB() {
+		go srv.runUSB(ctx, cancel, s, client)
+	} else {
+		remoteAddr := client.Conn.RemoteAddr().String()
+		host, _, _ := net.SplitHostPort(remoteAddr)
+		targetAddr := net.JoinHostPort(host, strconv.Itoa(client.UDPPort))
+		go srv.runWiFi(ctx, cancel, s, client, targetAddr)
+	}
+}
+
+// runWiFi starts the capture-encode-stream pipeline using UDP transport.
+func (srv *server) runWiFi(ctx context.Context, cancel context.CancelFunc, s *session, client control.ClientConn, targetAddr string) {
+	defer cancel()
+	s.logf("starting WiFi pipeline: %dx%d @ %d bps → %s", client.Width, client.Height, client.Bitrate, targetAddr)
+
 	udpStreamer, err := stream.NewUDPStreamer(targetAddr)
 	if err != nil {
-		log.Printf("UDP streamer error: %v", err)
+		s.logf("UDP streamer error: %v", err)
 		return
 	}
 	defer udpStreamer.Close()
 
-	startPipelineCommon(ctx, cancel, width, height, bitrate, udpStreamer, touchServer)
+	srv.runPipeline(ctx, s, client, udpStreamer)
 }
 
-// startPipelineUSB starts the capture-encode-stream pipeline using TCP transport.
-func startPipelineUSB(ctx context.Context, cancel context.CancelFunc, width, height, bitrate int, touchServer *touch.Server) {
+// runUSB starts the capture-encode-stream pipeline using TCP transport.
+func (srv *server) runUSB(ctx context.Context, cancel context.CancelFunc, s *session, client control.ClientConn) {
 	defer cancel()
-	log.Printf("starting USB pipeline: %dx%d @ %d bps (TCP video)", width, height, bitrate)
+	s.logf("starting USB pipeline: %dx%d @ %d bps (TCP video)", client.Width, client.Height, client.Bitrate)
 
-	// Wait for client to connect to TCP video port
-	if err := tcpVideoServer.AcceptOne(); err != nil {
-		log.Printf("TCP video accept error: %v", err)
+	// Wait for this session's phone to connect to the video port
+	videoStream, err := srv.video.Accept(ctx, s.id, videoConnectTimeout)
+	if err != nil {
+		s.logf("TCP video accept error: %v", err)
 		return
 	}
+	defer videoStream.Close()
 
-	startPipelineCommon(ctx, cancel, width, height, bitrate, tcpVideoServer, touchServer)
+	srv.runPipeline(ctx, s, client, videoStream)
 }
 
-// startPipelineCommon contains the shared pipeline logic for both WiFi and USB modes.
-func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, height, bitrate int, videoStreamer stream.Streamer, touchServer *touch.Server) {
-	// Virtual display
+// runPipeline contains the shared pipeline logic for both WiFi and USB modes.
+func (srv *server) runPipeline(ctx context.Context, s *session, client control.ClientConn, videoStreamer stream.Streamer) {
+	width, height, bitrate := client.Width, client.Height, client.Bitrate
+
+	// Virtual display: its serial identifies this phone to macOS
 	vd, err := display.New(display.Config{
 		Width:  width,
 		Height: height,
 		PPI:    224,
+		Serial: displaySerial(s.deviceID),
+		Name:   s.name,
 	})
 	if err != nil {
-		log.Printf("virtual display error: %v", err)
+		s.logf("virtual display error: %v", err)
 		return
 	}
 	defer vd.Close()
-	log.Printf("virtual display created: 0x%x (%dx%d)", vd.DisplayID(), width, height)
+	s.logf("virtual display created: 0x%x (%dx%d)", vd.DisplayID(), width, height)
 
 	// macOS places a new virtual display at a default spot; put it back where the
-	// user last arranged it. The position is saved whenever it changes (polled,
-	// since a SIGTERM restart exits without running this function's defers).
-	if x, y, ok := loadDisplayOrigin(); ok {
+	// user last arranged this phone's display. The position is saved whenever it
+	// changes (polled, since a SIGTERM restart exits without running defers).
+	if x, y, ok := srv.origins.load(s.deviceID); ok {
 		if err := vd.SetOrigin(x, y); err != nil {
-			log.Printf("restore display position: %v", err)
+			s.logf("restore display position: %v", err)
 		} else {
-			log.Printf("display position restored: (%d,%d)", x, y)
+			s.logf("display position restored: (%d,%d)", x, y)
 		}
 	}
 	stopTracking := make(chan struct{})
 	trackingDone := make(chan struct{})
-	go trackDisplayOrigin(vd, stopTracking, trackingDone)
+	go srv.trackDisplayOrigin(s, vd, stopTracking, trackingDone)
 	// Registered after vd.Close, so it runs first: tracking stops before the display is destroyed.
 	defer func() {
 		close(stopTracking)
@@ -248,8 +267,8 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 	})
 	defer gesture.Close()
 
-	// Wire touch events → pen events bypass gesture recognizer
-	touchServer.OnEvent(func(e touch.Event) {
+	// Wire this session's touch events → pen events bypass gesture recognizer
+	srv.touch.Register(s.id, func(e touch.Event) {
 		if e.Type == touch.TouchTypePen {
 			switch e.Action {
 			case touch.TouchActionDown:
@@ -265,10 +284,10 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 			gesture.HandleEvent(e)
 		}
 	})
-	defer touchServer.OnEvent(nil)
-	log.Println("touch input enabled")
+	defer srv.touch.Unregister(s.id)
+	s.logf("touch input enabled")
 
-	stats := newPipelineStats()
+	stats := newPipelineStats(s.id)
 	go stats.run(ctx, 2*time.Second)
 
 	// H.264 encoder
@@ -295,7 +314,7 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 		captureUnix := time.Now().Add(-sinceCapture).UnixMicro()
 		sendStart := time.Now()
 		if err := videoStreamer.SendFrame(nal.Data, ft, uint64(captureUnix)); err != nil {
-			log.Printf("stream send error: %v", err)
+			s.logf("stream send error: %v", err)
 		}
 		stats.recordBytes(len(nal.Data))
 		if ft == stream.FrameTypeIDR || ft == stream.FrameTypeP {
@@ -303,7 +322,7 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 		}
 	})
 	if err != nil {
-		log.Printf("encoder error: %v", err)
+		s.logf("encoder error: %v", err)
 		return
 	}
 	defer enc.Close()
@@ -312,23 +331,23 @@ func startPipelineCommon(ctx context.Context, cancel context.CancelFunc, width, 
 	cap, err := capture.Start(vd.DisplayID(), defaultFPS, func(frame capture.Frame) {
 		defer capture.ReleasePixelBuffer(frame.PixelBuffer)
 		if err := enc.Encode(frame.PixelBuffer, frame.Timestamp); err != nil {
-			log.Printf("encode error: %v", err)
+			s.logf("encode error: %v", err)
 		}
 	})
 	if err != nil {
-		log.Printf("capture error: %v", err)
+		s.logf("capture error: %v", err)
 		return
 	}
 	defer cap.Stop()
 
-	log.Println("pipeline active (video + touch)")
+	s.logf("pipeline active (video + touch)")
 	<-ctx.Done()
-	log.Println("pipeline stopping...")
+	s.logf("pipeline stopping...")
 }
 
 // trackDisplayOrigin saves the display's position whenever the user moves it,
 // and once more when stop is closed.
-func trackDisplayOrigin(vd *display.VirtualDisplay, stop <-chan struct{}, done chan<- struct{}) {
+func (srv *server) trackDisplayOrigin(s *session, vd *display.VirtualDisplay, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	lastX, lastY := vd.Origin()
 	save := func() {
@@ -336,12 +355,12 @@ func trackDisplayOrigin(vd *display.VirtualDisplay, stop <-chan struct{}, done c
 		if x == lastX && y == lastY {
 			return
 		}
-		if err := saveDisplayOrigin(x, y); err != nil {
-			log.Printf("save display position: %v", err)
+		if err := srv.origins.save(s.deviceID, x, y); err != nil {
+			s.logf("save display position: %v", err)
 			return
 		}
 		lastX, lastY = x, y
-		log.Printf("display position saved: (%d,%d)", x, y)
+		s.logf("display position saved: (%d,%d)", x, y)
 	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -354,39 +373,4 @@ func trackDisplayOrigin(vd *display.VirtualDisplay, stop <-chan struct{}, done c
 			save()
 		}
 	}
-}
-
-// displayOriginPath is where the virtual display's last position is stored.
-func displayOriginPath() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "AndroidDisplay", "display-origin"), nil
-}
-
-func loadDisplayOrigin() (x, y int, ok bool) {
-	path, err := displayOriginPath()
-	if err != nil {
-		return 0, 0, false
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, 0, false
-	}
-	if _, err := fmt.Sscanf(string(data), "%d %d", &x, &y); err != nil {
-		return 0, 0, false
-	}
-	return x, y, true
-}
-
-func saveDisplayOrigin(x, y int) error {
-	path, err := displayOriginPath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(fmt.Sprintf("%d %d\n", x, y)), 0o644)
 }

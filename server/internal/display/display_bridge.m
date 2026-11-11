@@ -91,14 +91,17 @@ VirtualDisplayResult CreateVirtualDisplay(VirtualDisplayConfig config) {
         @try {
             [descriptor setValue:@(0x1234) forKey:@"vendorID"];
             [descriptor setValue:@(0x5678) forKey:@"productID"];
-            [descriptor setValue:@"AndroidMac Virtual Display" forKey:@"name"];
+            NSString *displayName = config.name[0] ? [NSString stringWithUTF8String:config.name]
+                                                   : @"AndroidMac Virtual Display";
+            [descriptor setValue:displayName forKey:@"name"];
             [descriptor setValue:@((unsigned int)config.width) forKey:@"maxPixelsWide"];
             [descriptor setValue:@((unsigned int)config.height) forKey:@"maxPixelsHigh"];
 
             // A fixed non-zero serial gives the display a stable UUID, so macOS
             // remembers its arrangement across reconnects (serial 0 → random UUID).
+            // It differs per phone so several phones are separate monitors.
             @try {
-                [descriptor setValue:@(0x414E4452) forKey:@"serialNum"]; // "ANDR"
+                [descriptor setValue:@(config.serial) forKey:@"serialNum"];
             } @catch (NSException *e) {
                 // serialNum may not exist on all versions, ignore
             }

@@ -6,15 +6,17 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/luke/android-mac/server/internal/protocol"
 )
 
 type ClientConn struct {
-	Conn    net.Conn
-	Hello   protocol.ClientHello
-	UDPPort int // actual UDP port reported by the client via ClientReady (0 for USB)
+	Conn      net.Conn
+	Hello     protocol.ClientHello
+	SessionID uint32 // unique per connection; routes this phone's touch and video connections
+	UDPPort   int    // actual UDP port reported by the client via ClientReady (0 for USB)
 	// Negotiated stream parameters (also sent to the client in ServerHello).
 	Width   int
 	Height  int
@@ -22,16 +24,17 @@ type ClientConn struct {
 }
 
 type Server struct {
-	listener   net.Listener
-	clients    []ClientConn
-	mu         sync.Mutex
-	streamPort int
-	touchPort  int
-	videoPort  int // TCP video port for USB mode
-	scale      float64
-	bitrate    int
-	onClient   func(ClientConn)
-	done       chan struct{}
+	listener    net.Listener
+	clients     []ClientConn
+	mu          sync.Mutex
+	nextSession atomic.Uint32
+	streamPort  int
+	touchPort   int
+	videoPort   int // TCP video port for USB mode
+	scale       float64
+	bitrate     int
+	onClient    func(ClientConn)
+	done        chan struct{}
 }
 
 func NewServer(port int, scale float64, bitrate int) (*Server, error) {
@@ -107,11 +110,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
+	session := s.nextSession.Add(1)
 	connType := "WiFi"
 	if hello.IsUSB() {
 		connType = "USB"
 	}
-	log.Printf("client connected: %s (%dx%d) [%s]", hello.Device, hello.Screen.Width, hello.Screen.Height, connType)
+	log.Printf("session %d: client connected: %s (%dx%d) [%s]", session, hello.Device, hello.Screen.Width, hello.Screen.Height, connType)
 
 	codec := "h264"
 	for _, c := range hello.Codecs {
@@ -124,8 +128,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	// Step 2: Send ServerHello with the server-chosen size and bitrate
 	width := scaleEven(hello.Screen.Width, s.scale)
 	height := scaleEven(hello.Screen.Height, s.scale)
-	log.Printf("stream config: %dx%d @ %d bps (scale %.2f)", width, height, s.bitrate, s.scale)
+	log.Printf("session %d: stream config: %dx%d @ %d bps (scale %.2f)", session, width, height, s.bitrate, s.scale)
 	response := protocol.ServerHello{
+		SessionID: session,
 		VirtualDisplay: protocol.DisplayInfo{
 			Width:  width,
 			Height: height,
@@ -153,15 +158,15 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 	if hello.IsUSB() {
-		log.Println("client ready: USB mode (TCP video)")
+		log.Printf("session %d: client ready: USB mode (TCP video)", session)
 	} else {
-		log.Printf("client ready: UDP port %d", ready.UDPPort)
+		log.Printf("session %d: client ready: UDP port %d", session, ready.UDPPort)
 	}
 
 	// Clear the read deadline after successful handshake.
 	conn.SetReadDeadline(time.Time{})
 
-	client := ClientConn{Conn: conn, Hello: hello, UDPPort: ready.UDPPort, Width: width, Height: height, Bitrate: s.bitrate}
+	client := ClientConn{Conn: conn, Hello: hello, SessionID: session, UDPPort: ready.UDPPort, Width: width, Height: height, Bitrate: s.bitrate}
 	s.mu.Lock()
 	s.clients = append(s.clients, client)
 	s.mu.Unlock()
