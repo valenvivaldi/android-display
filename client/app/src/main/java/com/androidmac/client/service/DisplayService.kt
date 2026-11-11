@@ -10,11 +10,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.androidmac.client.R
 import com.androidmac.client.control.ControlClient
 import com.androidmac.client.touch.TouchEvent
@@ -104,6 +107,7 @@ class DisplayService : Service() {
 
     // 連線參數
     private var serverHost: String = ""
+    private var sessionId: Long = 0 // from ServerHello; routes this phone's touch and video connections on the Mac
     private var touchPort: Int = 0
     private var videoPort: Int = 0
     private var videoWidth: Int = 0
@@ -146,14 +150,15 @@ class DisplayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
 
         // 註冊中斷廣播
-        registerReceiver(
+        ContextCompat.registerReceiver(
+            this,
             disconnectReceiver,
             IntentFilter(ACTION_DISCONNECT),
-            RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
     }
 
@@ -168,7 +173,8 @@ class DisplayService : Service() {
         videoWidth = intent?.getIntExtra("width", 1920) ?: 1920
         videoHeight = intent?.getIntExtra("height", 1080) ?: 1080
         connectionType = intent?.getStringExtra("connectionType") ?: "wifi"
-        Log.d(TAG, "Connection: type=$connectionType host=$serverHost touchPort=$touchPort videoPort=$videoPort")
+        sessionId = intent?.getLongExtra("sessionId", 0) ?: 0
+        Log.d(TAG, "Connection: session=$sessionId type=$connectionType host=$serverHost touchPort=$touchPort videoPort=$videoPort")
 
         // 取得 ControlClient
         controlClient = pendingControlClient
@@ -265,7 +271,7 @@ class DisplayService : Service() {
         controlClient?.sendReady(0)
         Log.d(TAG, "USB: Sent ClientReady (TCP mode)")
 
-        val receiver = TcpVideoReceiver(serverHost, videoPort)
+        val receiver = TcpVideoReceiver(serverHost, videoPort, sessionId)
         receiver.connect()
         tcpVideoReceiver = receiver
         Log.d(TAG, "USB: TCP video connected to $serverHost:$videoPort")
@@ -313,7 +319,7 @@ class DisplayService : Service() {
         serviceScope.launch {
             try {
                 val sender = TouchSender()
-                sender.connect(serverHost, touchPort)
+                sender.connect(serverHost, touchPort, sessionId)
                 touchSender = sender
                 Log.d(TAG, "Touch connected to $serverHost:$touchPort")
 
@@ -435,7 +441,7 @@ class DisplayService : Service() {
         Log.d(TAG, "Disconnecting...")
         disconnectCallback?.onDisconnected()
         cleanupConnections()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
@@ -460,6 +466,8 @@ class DisplayService : Service() {
     // ——— 通知相關 ———
 
     private fun createNotificationChannel() {
+        // Notification channels exist from Android 8 (API 26); older versions ignore the channel id.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,
             getString(R.string.notification_channel_name),

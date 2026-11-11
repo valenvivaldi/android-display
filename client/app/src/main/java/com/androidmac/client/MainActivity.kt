@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.widget.Button
@@ -134,8 +135,10 @@ class MainActivity : AppCompatActivity() {
                 val metrics = resources.displayMetrics
 
                 // The Mac app decides the streamed resolution and bitrate; send the native size.
+                // The Android ID is stable per phone, so the Mac remembers this phone's display position.
+                val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
                 val serverHello = controlClient.connect(
-                    host, port, metrics.widthPixels, metrics.heightPixels, metrics.densityDpi, connectionType
+                    host, port, metrics.widthPixels, metrics.heightPixels, metrics.densityDpi, connectionType, deviceId
                 )
 
                 Log.d(TAG, "Handshake complete: $serverHello")
@@ -151,8 +154,9 @@ class MainActivity : AppCompatActivity() {
                     putExtra("width", serverHello.virtualDisplay.width)
                     putExtra("height", serverHello.virtualDisplay.height)
                     putExtra("connectionType", connectionType)
+                    putExtra("sessionId", serverHello.sessionId)
                 }
-                startForegroundService(serviceIntent)
+                ContextCompat.startForegroundService(this@MainActivity, serviceIntent)
 
                 // 啟動 DisplayActivity
                 val displayIntent = Intent(this@MainActivity, DisplayActivity::class.java).apply {

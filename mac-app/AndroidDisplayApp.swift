@@ -1,22 +1,142 @@
 // Android Display — Mac front-end for android-display-server.
-// Runs the bundled server as a child process with the chosen resolution scale and
-// bitrate, shows connection status parsed from its log, and stops it on quit.
+// Runs the bundled server as a child process, lists the connected phones parsed from its
+// log, lets you set the resolution and bitrate of each phone, and stops the server on quit.
+//
+// Settings live in ~/Library/Application Support/AndroidDisplay/device-settings.json. The
+// server re-reads that file on every handshake, so a change applies the next time the phone
+// connects, without restarting the server.
 
 import AppKit
 import ApplicationServices
 import CoreGraphics
 import SwiftUI
 
-private let scaleOptions: [Double] = [1.0, 0.9, 0.75, 0.6, 0.5]
+private let scaleOptions: [Double] = [1.0, 0.9, 0.75, 0.6, 0.5, 0.4, 0.3]
 private let bitrateOptions: [Int] = [12_000_000, 8_000_000, 6_000_000, 4_000_000, 2_000_000, 1_000_000]
 
-enum ServerState {
-    case stopped, waiting, connected
+private func scalePercent(_ s: Double) -> String { "\(Int((s * 100).rounded())) %" }
+private func bitrateLabel(_ b: Int) -> String { "\(b / 1_000_000) Mbps" }
+
+/// Streamed size for a native size at a scale; even dimensions, like the server (H.264 needs them).
+private func scaledSize(_ native: (width: Int, height: Int), _ s: Double) -> String {
+    "\(Int(Double(native.width) * s) & ~1)×\(Int(Double(native.height) * s) & ~1)"
 }
 
-struct ServerConfig: Equatable {
+// MARK: - Settings
+
+struct StreamDefaults: Codable, Equatable {
     var scale: Double
     var bitrate: Int
+}
+
+/// One phone's own settings. A nil scale/bitrate means "use the default".
+struct PhoneSettings: Codable, Equatable {
+    var name: String
+    var scale: Double?
+    var bitrate: Int?
+    var nativeWidth: Int?
+    var nativeHeight: Int?
+
+    var nativeSize: (width: Int, height: Int)? {
+        guard let w = nativeWidth, let h = nativeHeight else { return nil }
+        return (w, h)
+    }
+}
+
+struct SettingsFile: Codable {
+    var defaults: StreamDefaults
+    var devices: [String: PhoneSettings]
+}
+
+@MainActor
+final class SettingsStore: ObservableObject {
+    static let shared = SettingsStore()
+
+    @Published private(set) var file: SettingsFile
+
+    private let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/AndroidDisplay/device-settings.json")
+
+    private init() {
+        if let data = try? Data(contentsOf: url), let loaded = try? JSONDecoder().decode(SettingsFile.self, from: data) {
+            file = loaded
+        } else {
+            // First run with this file: carry over the global choice older versions kept in preferences.
+            let prefs = UserDefaults.standard
+            let scale = prefs.object(forKey: "scale") as? Double ?? 0.75
+            let bitrate = prefs.object(forKey: "bitrate") as? Int ?? 4_000_000
+            file = SettingsFile(defaults: StreamDefaults(scale: scale, bitrate: bitrate), devices: [:])
+            save()
+        }
+    }
+
+    var defaults: StreamDefaults { file.defaults }
+
+    func scale(for id: String) -> Double { file.devices[id]?.scale ?? file.defaults.scale }
+    func bitrate(for id: String) -> Int { file.devices[id]?.bitrate ?? file.defaults.bitrate }
+
+    func setDefaults(scale: Double? = nil, bitrate: Int? = nil) {
+        if let scale { file.defaults.scale = scale }
+        if let bitrate { file.defaults.bitrate = bitrate }
+        save()
+    }
+
+    func setScale(_ scale: Double?, for id: String) {
+        guard file.devices[id] != nil else { return }
+        file.devices[id]?.scale = scale
+        save()
+    }
+
+    func setBitrate(_ bitrate: Int?, for id: String) {
+        guard file.devices[id] != nil else { return }
+        file.devices[id]?.bitrate = bitrate
+        save()
+    }
+
+    /// Remembers a phone the first time it connects, and refreshes its name and native size.
+    func noteConnected(id: String, name: String, width: Int, height: Int) {
+        guard !id.isEmpty else { return }
+        var phone = file.devices[id] ?? PhoneSettings(name: name)
+        phone.name = name
+        phone.nativeWidth = width
+        phone.nativeHeight = height
+        guard file.devices[id] != phone else { return }
+        file.devices[id] = phone
+        save()
+    }
+
+    func forget(_ id: String) {
+        file.devices[id] = nil
+        save()
+    }
+
+    private func save() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try encoder.encode(file).write(to: url, options: .atomic) // the server may read it at any moment
+        } catch {
+            ServerController.shared.report("No se pudieron guardar los ajustes: \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Server
+
+enum ServerState {
+    case stopped, running
+}
+
+/// One connected phone, as reported by the server's "session N: …" log lines.
+struct PhoneSession: Identifiable, Equatable {
+    let id: Int
+    var deviceId: String
+    var device: String
+    var streamSize: String?
+    var appliedScale: Double?
+    var appliedBitrate: Int?
+    var isStreaming = false
 }
 
 @MainActor
@@ -24,11 +144,11 @@ final class ServerController: ObservableObject {
     static let shared = ServerController()
 
     @Published private(set) var state: ServerState = .stopped
-    @Published private(set) var running: ServerConfig?
-    @Published private(set) var device: String?
+    @Published private(set) var sessions: [PhoneSession] = []
+    /// Native screen size of the most recently connected phone; used to preview the pixel sizes.
     @Published private(set) var nativeSize: (width: Int, height: Int)?
-    @Published private(set) var streamSize: String?
-    @Published private(set) var noAdbDevice = false
+    /// Serials of the phones adb currently sees; the server forwards their ports as they appear.
+    @Published private(set) var usbDevices: Set<String> = []
     @Published private(set) var error: String?
 
     let logURL = FileManager.default.homeDirectoryForCurrentUser
@@ -43,18 +163,23 @@ final class ServerController: ObservableObject {
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
     }
 
-    func start(_ config: ServerConfig) {
+    func report(_ message: String) { error = message }
+
+    /// Starts the server. The scale/bitrate flags are only what a phone gets when the settings
+    /// file doesn't cover it; the file itself is what normally decides.
+    func start() {
         guard process == nil else { return }
         guard let binary = Bundle.main.url(forResource: "android-display-server", withExtension: nil) else {
             error = "No se encontró android-display-server dentro de la app."
             return
         }
+        let defaults = SettingsStore.shared.defaults
 
         let proc = Process()
         proc.executableURL = binary
         proc.arguments = [
-            "-scale", String(config.scale),
-            "-bitrate", String(config.bitrate),
+            "-scale", String(defaults.scale),
+            "-bitrate", String(defaults.bitrate),
             "-exit-on-stdin-eof",
         ]
         var env = ProcessInfo.processInfo.environment
@@ -96,9 +221,8 @@ final class ServerController: ObservableObject {
         process = proc
         stdinPipe = stdin
         outputPipe = output
-        running = config
         error = nil
-        state = .waiting
+        state = .running
     }
 
     /// Stops the server and waits (up to ~3 s) for it to clean up its adb forwards.
@@ -120,19 +244,13 @@ final class ServerController: ObservableObject {
         reset()
     }
 
-    func restart(_ config: ServerConfig) {
-        stop()
-        start(config)
-    }
-
     private func reset() {
         process = nil
         stdinPipe = nil
         outputPipe = nil
-        running = nil
         state = .stopped
-        device = nil
-        streamSize = nil
+        sessions = []
+        usbDevices = []
         lineBuffer.removeAll()
     }
 
@@ -157,22 +275,30 @@ final class ServerController: ObservableObject {
 
     private func handle(line: String) {
         if line.contains("control server on port") {
-            state = .waiting
-        } else if let m = line.firstMatch(of: /client connected: (.+) \((\d+)x(\d+)\)/) {
-            device = String(m.1)
-            nativeSize = (Int(m.2) ?? 0, Int(m.3) ?? 0)
-        } else if let m = line.firstMatch(of: /stream config: (\d+)x(\d+)/) {
-            streamSize = "\(m.1)×\(m.2)"
-        } else if line.contains("pipeline active") {
-            state = .connected
+            state = .running
+        } else if let m = line.firstMatch(of: /session (\d+): client connected: (.+) \((\d+)x(\d+)\) \[\w+\] id=(\S*)/) {
+            let id = Int(m.1) ?? 0
+            let native = (width: Int(m.3) ?? 0, height: Int(m.4) ?? 0)
+            sessions.removeAll { $0.id == id }
+            sessions.append(PhoneSession(id: id, deviceId: String(m.5), device: String(m.2)))
+            nativeSize = native
+            SettingsStore.shared.noteConnected(id: String(m.5), name: String(m.2), width: native.width, height: native.height)
+        } else if let m = line.firstMatch(of: /session (\d+): stream config: (\d+)x(\d+) @ (\d+) bps \(scale ([0-9.]+)\)/) {
+            update(session: Int(m.1) ?? 0) {
+                $0.streamSize = "\(m.2)×\(m.3)"
+                $0.appliedBitrate = Int(m.4)
+                $0.appliedScale = Double(m.5)
+            }
+        } else if let m = line.firstMatch(of: /session (\d+): pipeline active/) {
+            update(session: Int(m.1) ?? 0) { $0.isStreaming = true }
             error = nil
-        } else if line.contains("client disconnected") || line.contains("pipeline stopping") {
-            state = .waiting
-            streamSize = nil
-        } else if line.contains("ADB available but no device connected") {
-            noAdbDevice = true
-        } else if line.contains("ADB reverse forwarding enabled") {
-            noAdbDevice = false
+        } else if let m = line.firstMatch(of: /session (\d+): (client disconnected|pipeline stopping)/) {
+            let id = Int(m.1) ?? 0
+            sessions.removeAll { $0.id == id }
+        } else if let m = line.firstMatch(of: /adb device connected: (\S+)/) {
+            usbDevices.insert(String(m.1))
+        } else if let m = line.firstMatch(of: /adb device disconnected: (\S+)/) {
+            usbDevices.remove(String(m.1))
         } else if line.contains("address already in use") {
             error = "El puerto 9000 está ocupado: hay otro servidor corriendo."
         } else if line.contains("capture error") {
@@ -181,7 +307,14 @@ final class ServerController: ObservableObject {
             error = "Falló el pipeline de video. Revisá el log."
         }
     }
+
+    private func update(session id: Int, _ change: (inout PhoneSession) -> Void) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        change(&sessions[index])
+    }
 }
+
+// MARK: - UI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -205,15 +338,21 @@ struct AndroidDisplayApp: App {
 
 struct ContentView: View {
     @ObservedObject private var server = ServerController.shared
-    @AppStorage("scale") private var scale = 0.75
-    @AppStorage("bitrate") private var bitrate = 4_000_000
+    @ObservedObject private var settings = SettingsStore.shared
     @State private var accessibilityOK = AXIsProcessTrusted()
     @State private var screenCaptureOK = CGPreflightScreenCaptureAccess()
 
     private let permissionTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
-    private var selected: ServerConfig { ServerConfig(scale: scale, bitrate: bitrate) }
-    private var hasPendingChanges: Bool { server.running != nil && server.running != selected }
+    private var phones: [(id: String, phone: PhoneSettings)] {
+        func isConnected(_ id: String) -> Bool { server.sessions.contains { $0.deviceId == id } }
+        return settings.file.devices
+            .map { (id: $0.key, phone: $0.value) }
+            .sorted { a, b in
+                let (ca, cb) = (isConnected(a.id), isConnected(b.id))
+                return ca != cb ? ca : a.phone.name.localizedCompare(b.phone.name) == .orderedAscending
+            }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -221,29 +360,17 @@ struct ContentView: View {
 
             Divider()
 
-            Form {
-                Picker("Resolución", selection: $scale) {
-                    ForEach(scaleOptions, id: \.self) { Text(scaleLabel($0)).tag($0) }
-                }
-                Picker("Calidad", selection: $bitrate) {
-                    ForEach(bitrateOptions, id: \.self) { Text(bitrateLabel($0)).tag($0) }
-                }
-            }
+            defaultsSection
 
-            if hasPendingChanges {
-                Text("Los cambios se aplican al reiniciar el servidor. El celular se desconecta: tocá Conectar de nuevo.")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+            if !phones.isEmpty {
+                phonesSection
             }
 
             HStack {
-                if server.running == nil {
-                    Button("Iniciar") { server.start(selected) }
+                if server.state == .stopped {
+                    Button("Iniciar") { server.start() }
                         .keyboardShortcut(.defaultAction)
                 } else {
-                    Button("Aplicar y reiniciar") { server.restart(selected) }
-                        .keyboardShortcut(.defaultAction)
                     Button("Detener") { server.stop() }
                 }
                 Spacer()
@@ -256,13 +383,15 @@ struct ContentView: View {
             }
         }
         .padding(20)
-        .frame(width: 440)
-        .onAppear { server.start(selected) }
+        .frame(width: 520)
+        .onAppear { server.start() }
         .onReceive(permissionTimer) { _ in
             accessibilityOK = AXIsProcessTrusted()
             screenCaptureOK = CGPreflightScreenCaptureAccess()
         }
     }
+
+    // MARK: Status
 
     private var status: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -270,20 +399,76 @@ struct ContentView: View {
                 Circle().fill(statusColor).frame(width: 10, height: 10)
                 Text(statusTitle).font(.headline)
             }
-            if let detail = statusDetail {
-                Text(detail).font(.callout).foregroundStyle(.secondary)
+            if server.state == .running, !server.usbDevices.isEmpty {
+                let n = server.usbDevices.count
+                Text("USB: \(n) detectado\(n == 1 ? "" : "s")").font(.callout).foregroundStyle(.secondary)
             }
             if let error = server.error {
                 Text(error).font(.callout).foregroundStyle(.red)
             }
-            if server.noAdbDevice {
-                Text("No había celular por USB al iniciar. Conectalo y tocá Aplicar y reiniciar para habilitar USB.")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var statusColor: Color {
+        if server.state == .stopped { return .gray }
+        return server.sessions.contains(where: \.isStreaming) ? .green : .orange
+    }
+
+    private var statusTitle: String {
+        guard server.state == .running else { return "Servidor detenido" }
+        switch server.sessions.count {
+        case 0: return "Esperando celulares…"
+        case 1: return "1 celular conectado"
+        default: return "\(server.sessions.count) celulares conectados"
+        }
+    }
+
+    // MARK: Defaults
+
+    private var defaultsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Predeterminado").font(.headline)
+            Text("Se usa en los celulares que no tienen ajustes propios.")
+                .font(.callout).foregroundStyle(.secondary)
+            Form {
+                Picker("Resolución", selection: Binding(
+                    get: { settings.defaults.scale },
+                    set: { settings.setDefaults(scale: $0) }
+                )) {
+                    ForEach(scaleOptions, id: \.self) { s in
+                        Text(scaleLabel(s, native: server.nativeSize)).tag(s)
+                    }
+                }
+                Picker("Calidad", selection: Binding(
+                    get: { settings.defaults.bitrate },
+                    set: { settings.setDefaults(bitrate: $0) }
+                )) {
+                    ForEach(bitrateOptions, id: \.self) { Text(bitrateLabel($0)).tag($0) }
+                }
             }
         }
     }
+
+    // MARK: Phones
+
+    private var phonesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Celulares").font(.headline)
+            Text("Cada celular puede tener su propia resolución y calidad. Se aplican la próxima vez que ese celular se conecta.")
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(phones, id: \.id) { entry in
+                PhoneRow(id: entry.id, phone: entry.phone, session: server.sessions.first { $0.deviceId == entry.id })
+            }
+        }
+    }
+
+    private func scaleLabel(_ s: Double, native: (width: Int, height: Int)?) -> String {
+        guard let native else { return scalePercent(s) }
+        return "\(scalePercent(s))  (\(scaledSize(native, s)))"
+    }
+
+    // MARK: Permissions
 
     private var permissions: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -306,44 +491,74 @@ struct ContentView: View {
         }
     }
 
-    private var statusColor: Color {
-        switch server.state {
-        case .stopped: return .gray
-        case .waiting: return .orange
-        case .connected: return .green
-        }
-    }
-
-    private var statusTitle: String {
-        switch server.state {
-        case .stopped: return "Servidor detenido"
-        case .waiting: return "Esperando al celular…"
-        case .connected: return "Conectado" + (server.device.map { ": \($0)" } ?? "")
-        }
-    }
-
-    private var statusDetail: String? {
-        guard let running = server.running else { return nil }
-        var parts: [String] = []
-        if server.state == .connected, let size = server.streamSize {
-            parts.append(size)
-        }
-        parts.append("\(Int(running.scale * 100)) %")
-        parts.append(bitrateLabel(running.bitrate))
-        return parts.joined(separator: " · ")
-    }
-
-    private func scaleLabel(_ s: Double) -> String {
-        let pct = "\(Int(s * 100)) %"
-        guard let native = server.nativeSize else { return pct }
-        let w = Int(Double(native.width) * s) & ~1
-        let h = Int(Double(native.height) * s) & ~1
-        return "\(pct)  (\(w)×\(h))"
-    }
-
-    private func bitrateLabel(_ b: Int) -> String { "\(b / 1_000_000) Mbps" }
-
     private func openSettings(_ url: String) {
         if let url = URL(string: url) { NSWorkspace.shared.open(url) }
+    }
+}
+
+/// One phone's resolution and bitrate. "Predeterminada" clears the phone's own value.
+struct PhoneRow: View {
+    let id: String
+    let phone: PhoneSettings
+    let session: PhoneSession?
+    @ObservedObject private var settings = SettingsStore.shared
+
+    private var effectiveScale: Double { settings.scale(for: id) }
+    private var effectiveBitrate: Int { settings.bitrate(for: id) }
+
+    /// The running connection was made with other values than the ones now chosen.
+    private var needsReconnect: Bool {
+        guard let session, let scale = session.appliedScale, let bitrate = session.appliedBitrate else { return false }
+        return abs(scale - effectiveScale) > 0.001 || bitrate != effectiveBitrate
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(session == nil ? Color.gray : (session?.isStreaming == true ? Color.green : Color.orange))
+                    .frame(width: 8, height: 8)
+                Text(phone.name).font(.headline)
+                if let size = session?.streamSize {
+                    Text(size).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if session == nil {
+                    Button("Quitar") { settings.forget(id) }.buttonStyle(.link)
+                }
+            }
+
+            HStack {
+                Picker("Resolución", selection: Binding(
+                    get: { phone.scale },
+                    set: { settings.setScale($0, for: id) }
+                )) {
+                    Text("Predeterminada (\(scalePercent(settings.defaults.scale)))").tag(Double?.none)
+                    ForEach(scaleOptions, id: \.self) { s in
+                        Text(label(for: s)).tag(Double?.some(s))
+                    }
+                }
+                Picker("Calidad", selection: Binding(
+                    get: { phone.bitrate },
+                    set: { settings.setBitrate($0, for: id) }
+                )) {
+                    Text("Predeterminada (\(bitrateLabel(settings.defaults.bitrate)))").tag(Int?.none)
+                    ForEach(bitrateOptions, id: \.self) { Text(bitrateLabel($0)).tag(Int?.some($0)) }
+                }
+            }
+
+            if needsReconnect {
+                Text("Reconectá este celular para aplicar el cambio.")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+    }
+
+    private func label(for s: Double) -> String {
+        guard let native = phone.nativeSize else { return scalePercent(s) }
+        return "\(scalePercent(s))  (\(scaledSize(native, s)))"
     }
 }

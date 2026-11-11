@@ -42,12 +42,13 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ./server/android-display-server -scale 0.75 -bitrate 4000000
 ```
 
-- `-scale` (0.25–1): streamed size as a fraction of the device's native screen. `-bitrate` in bps (default 8 Mbps). The Android app has no quality settings; it only reports its native size.
+- `-scale` (0.25–1): streamed size as a fraction of the device's native screen. `-bitrate` in bps (default 8 Mbps). These flags are only the fallback for phones the settings file doesn't cover. The Android app has no quality settings; it only reports its native size.
+- Per-phone settings: the server re-reads `~/Library/Application Support/AndroidDisplay/device-settings.json` on every handshake (the mac app writes it). Precedence per value: the phone's own entry, the file's `defaults`, the flags. Out-of-range values are ignored. A change applies the next time that phone connects; no server restart.
 - `-exit-on-stdin-eof`: shut down when stdin closes. The mac app uses this so the server never outlives it.
-- USB: the server sets up `adb reverse` **only at startup**. If the phone is plugged in later, restart the server.
+- Several phones at once: each connection gets its own session (id from the handshake) with its own virtual display, encoder, capture and touch routing. Touch and TCP video use one shared port each; the phone sends its 4-byte big-endian session id first. `adb reverse` is set up for every attached device, and a phone plugged in later is picked up within 2 s.
 - On the phone, pick USB or WiFi and tap Conectar.
 
-Logs: the mac app writes the server log to `~/Library/Logs/AndroidDisplay.log` (truncated on each app launch). The app UI state is derived by parsing those log lines (`ServerController.handle(line:)`). If you change a server log message, update the parser.
+Logs: the mac app writes the server log to `~/Library/Logs/AndroidDisplay.log` (truncated on each app launch). Per-session lines start with `session N:`. The app UI state is derived by parsing those lines (`ServerController.handle(line:)`). If you change a server log message, update the parser.
 
 ## macOS permissions (common source of "it doesn't work")
 
@@ -61,11 +62,14 @@ Logs: the mac app writes the server log to `~/Library/Logs/AndroidDisplay.log` (
 
 - The virtual display can move after it is created (macOS restoring the arrangement, user dragging it). Never cache its bounds; query `CGDisplayBounds` when needed.
 - The display needs a fixed non-zero `serialNum`. With 0, macOS gives it a random UUID per connection and forgets its arrangement.
-- The display position is saved in global coordinates to `~/Library/Application Support/AndroidDisplay/display-origin`. If other displays are rearranged, the saved spot may be stale. Moving it once in System Settings fixes it.
-- Changing scale or bitrate requires a new connection: the client sizes its decoder from ServerHello.
+- Each phone's display position is saved in global coordinates, keyed by its device id (the Android ID the phone sends), in `~/Library/Application Support/AndroidDisplay/display-origins.json`, and restored on its next connection. If other displays are rearranged, the saved spot may be stale. Moving it once in System Settings fixes it. The display serial is derived from the same id, so each phone is a separate monitor.
+- Changing a phone's scale or bitrate requires reconnecting it: the client sizes its decoder from ServerHello.
 - Port 9000 is fixed. "address already in use" means another server instance is still running.
 - While streaming, `DisplayActivity` sets `FLAG_KEEP_SCREEN_ON`, so the phone neither dims nor sleeps. To keep the connect screen awake too, use `adb shell settings put global stay_on_while_plugged_in 7`. Some phones report USB charging as AC, so `2` (USB only) does nothing on them.
 - Qualcomm decoders (`c2.qti.avc.decoder` and friends) ignore `KEY_LOW_LATENCY` unless they declare the feature. Without `vendor.qti-ext-dec-low-latency.enable` / `vendor.qti-ext-dec-picture-order.enable` they hold about 8 frames (~130 ms). Keep those keys in `VideoDecoder.start()`.
+- **Known issue:** touch injection fails when a phone's display is placed to the left of (or above) the main display, i.e. at negative global coordinates. The cursor ends up on the main display's edge instead of the phone's display. macOS accepts `CGWarpMouseCursorPosition` there, but a posted click event does not stay at a negative `x`. Positive coordinates work. Workaround: arrange the phone's display to the right of the main one.
+- Android ID differs per app, so `adb shell settings get secure android_id` does not match the id the app sends. Read it from the `id=` field of the `client connected` log line.
+- On Android 5.1 (legacy variant) `adb shell input tap` uses the landscape logical coordinates, while `screencap` gives the unrotated framebuffer. Get button positions with `adb shell uiautomator dump` instead of reading them off the screenshot.
 
 ## Tests
 
@@ -73,7 +77,7 @@ Logs: the mac app writes the server log to `~/Library/Logs/AndroidDisplay.log` (
 cd server && go test ./...
 ```
 
-`internal/control` covers the handshake, including server-side scaling and even rounding. At the time of writing, `internal/stream` (`packet_test.go` type mismatch) and `internal/input` (`TestMoveWithinThresholdDoesNotDrag`) already fail upstream. Don't treat those as regressions from your change.
+`internal/control` covers the handshake (server-side scaling, per-phone settings, distinct session ids), `internal/touch` and `internal/stream` the routing of several phones by session id, `internal/adb` the parsing of `adb devices`, and `cmd/server` the per-phone settings precedence and position store. `internal/input` has one test that already fails upstream (`TestMoveWithinThresholdDoesNotDrag`); don't treat it as a regression from your change. Use `go test -vet=off` if `go vet` is killed on your machine.
 
 ## Verifying end to end without touching the phone
 

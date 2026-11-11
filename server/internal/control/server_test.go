@@ -67,6 +67,9 @@ func TestHandshake(t *testing.T) {
 	if response.TouchPort != 9001 {
 		t.Errorf("expected touch port 9001, got %d", response.TouchPort)
 	}
+	if response.SessionID == 0 {
+		t.Error("session id should not be 0")
+	}
 
 	// Step 3: Send ClientReady with the actual UDP port
 	ready := protocol.ClientReady{UDPPort: 12345}
@@ -83,9 +86,119 @@ func TestHandshake(t *testing.T) {
 		if client.Width != 1728 || client.Height != 764 || client.Bitrate != 4_000_000 {
 			t.Errorf("client conn has %dx%d @ %d, want 1728x764 @ 4000000", client.Width, client.Height, client.Bitrate)
 		}
+		if client.SessionID != response.SessionID {
+			t.Errorf("session id %d sent to the phone, %d given to the pipeline", response.SessionID, client.SessionID)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for client ready callback")
 	}
+}
+
+// Several phones connect at the same time. Each needs its own session id: the
+// touch and video connections are routed by it, so a repeat would cross two phones.
+func TestHandshakeAssignsDistinctSessions(t *testing.T) {
+	srv, err := NewServer(0, 1, 8_000_000)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Stop()
+
+	ready := make(chan ClientConn, 3)
+	srv.OnClient(func(c ClientConn) { ready <- c })
+	go srv.AcceptLoop()
+
+	sessions := map[uint32]string{}
+	for _, device := range []string{"moto g(9) plus", "XT1025", "Pixel"} {
+		conn, err := net.DialTimeout("tcp", srv.Addr(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		enc := json.NewEncoder(conn)
+		hello := protocol.ClientHello{Device: device, DeviceID: "id-" + device, Screen: protocol.ScreenInfo{Width: 1080, Height: 2400}, Codecs: []string{"h264"}}
+		if err := enc.Encode(hello); err != nil {
+			t.Fatal(err)
+		}
+		var response protocol.ServerHello
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := json.NewDecoder(conn).Decode(&response); err != nil {
+			t.Fatalf("%s: read server hello: %v", device, err)
+		}
+		if other, dup := sessions[response.SessionID]; dup {
+			t.Fatalf("%s got session %d, already given to %s", device, response.SessionID, other)
+		}
+		sessions[response.SessionID] = device
+
+		if err := enc.Encode(protocol.ClientReady{}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case c := <-ready:
+			if c.Hello.DeviceID != "id-"+device {
+				t.Errorf("pipeline got device id %q, want %q", c.Hello.DeviceID, "id-"+device)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: timed out waiting for the client callback", device)
+		}
+	}
+}
+
+// Each phone gets the resolution and bitrate chosen for it, not one global value, and
+// the choice is made per handshake (the Mac app can change it while the server runs).
+func TestHandshakeUsesPerDeviceStreamSettings(t *testing.T) {
+	srv, err := NewServer(0, 1, 8_000_000) // defaults for phones the settings don't cover
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer srv.Stop()
+	small := true
+	srv.SetStreamSettings(func(deviceID string) (float64, int) {
+		switch deviceID {
+		case "tablet":
+			return 0.5, 2_000_000
+		case "phone":
+			if small {
+				return 0.75, 4_000_000
+			}
+			return 1, 6_000_000
+		}
+		return 1, 8_000_000
+	})
+	go srv.AcceptLoop()
+
+	handshake := func(deviceID string) protocol.ServerHello {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", srv.Addr(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close()
+		hello := protocol.ClientHello{Device: deviceID, DeviceID: deviceID, Screen: protocol.ScreenInfo{Width: 2000, Height: 1000}, Codecs: []string{"h264"}}
+		if err := json.NewEncoder(conn).Encode(hello); err != nil {
+			t.Fatal(err)
+		}
+		var response protocol.ServerHello
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := json.NewDecoder(conn).Decode(&response); err != nil {
+			t.Fatalf("%s: read server hello: %v", deviceID, err)
+		}
+		return response
+	}
+
+	check := func(deviceID string, width, height, bitrate int) {
+		t.Helper()
+		r := handshake(deviceID)
+		if r.VirtualDisplay.Width != width || r.VirtualDisplay.Height != height || r.Bitrate != bitrate {
+			t.Errorf("%s: got %dx%d @ %d, want %dx%d @ %d", deviceID, r.VirtualDisplay.Width, r.VirtualDisplay.Height, r.Bitrate, width, height, bitrate)
+		}
+	}
+	check("tablet", 1000, 500, 2_000_000)
+	check("phone", 1500, 750, 4_000_000)
+	check("unknown", 2000, 1000, 8_000_000)
+
+	small = false
+	check("phone", 2000, 1000, 6_000_000)
 }
 
 func TestHandshakeTimeout(t *testing.T) {

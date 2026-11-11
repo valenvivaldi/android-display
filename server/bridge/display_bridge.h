@@ -8,6 +8,8 @@ typedef struct {
     int height;
     int ppi;
     int hiDPI;
+    unsigned int serial; // identity of the display; macOS keys its saved arrangement on it
+    char name[64];       // shown in System Settings → Displays; empty = default
 } VirtualDisplayConfig;
 
 typedef struct {

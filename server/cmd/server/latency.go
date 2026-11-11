@@ -8,14 +8,15 @@ import (
 	"time"
 )
 
-// pipelineStats aggregates Mac-side per-frame timings and logs a summary
-// every interval:
+// pipelineStats aggregates Mac-side per-frame timings of one session and logs a
+// summary every interval:
 //
-//	latency mac: encode avg 6.1 p95 9.0 ms | send avg 0.3 p95 1.2 ms | 59 fps | 3.9 Mbps
+//	session 1: latency mac: encode avg 6.1 p95 9.0 ms | send avg 0.3 p95 1.2 ms | 59 fps | 3.9 Mbps
 //
 // encode = capture → encoded NAL available; send = time spent in SendFrame
 // (grows when the transport backs up).
 type pipelineStats struct {
+	session uint32
 	mu      sync.Mutex
 	encode  []time.Duration
 	send    []time.Duration
@@ -23,8 +24,8 @@ type pipelineStats struct {
 	started time.Time
 }
 
-func newPipelineStats() *pipelineStats {
-	return &pipelineStats{started: time.Now()}
+func newPipelineStats(session uint32) *pipelineStats {
+	return &pipelineStats{session: session, started: time.Now()}
 }
 
 // recordFrame adds one video frame (IDR or P).
@@ -67,8 +68,8 @@ func (s *pipelineStats) logAndReset() {
 	}
 	encAvg, encP95 := avgP95(encode)
 	sendAvg, sendP95 := avgP95(send)
-	log.Printf("latency mac: encode avg %.1f p95 %.1f ms | send avg %.1f p95 %.1f ms | %.0f fps | %.1f Mbps",
-		encAvg, encP95, sendAvg, sendP95, float64(len(encode))/elapsed, float64(bytes)*8/elapsed/1e6)
+	log.Printf("session %d: latency mac: encode avg %.1f p95 %.1f ms | send avg %.1f p95 %.1f ms | %.0f fps | %.1f Mbps",
+		s.session, encAvg, encP95, sendAvg, sendP95, float64(len(encode))/elapsed, float64(bytes)*8/elapsed/1e6)
 }
 
 // avgP95 returns the mean and 95th percentile in milliseconds. Sorts d in place.

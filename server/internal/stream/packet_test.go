@@ -48,7 +48,7 @@ func TestSplitNALUnits(t *testing.T) {
 
 	// Check fragment indices
 	for i, pkt := range packets {
-		if pkt.Header.FragIndex != uint8(i) {
+		if pkt.Header.FragIndex != uint16(i) {
 			t.Errorf("packet %d: fragIndex got %d, want %d", i, pkt.Header.FragIndex, i)
 		}
 		if pkt.Header.FragTotal != 3 {

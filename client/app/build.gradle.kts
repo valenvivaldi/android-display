@@ -8,8 +8,9 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.androidmac.client"
-        minSdk = 29
+        // Separate id so this build installs next to the regular app instead of replacing it.
+        applicationId = "com.androidmac.client.legacy"
+        minSdk = 22
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"

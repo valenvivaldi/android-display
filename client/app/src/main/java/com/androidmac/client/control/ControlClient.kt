@@ -22,6 +22,7 @@ class ControlClient {
      * @param height Native screen height
      * @param dpi    Display DPI
      * @param connectionType "wifi" or "usb"
+     * @param deviceId stable per-phone id; keys the display identity and saved position on the Mac
      */
     suspend fun connect(
         host: String,
@@ -29,7 +30,8 @@ class ControlClient {
         width: Int,
         height: Int,
         dpi: Int,
-        connectionType: String = "wifi"
+        connectionType: String = "wifi",
+        deviceId: String = ""
     ): ServerHello = withContext(Dispatchers.IO) {
         val sock = Socket(host, port)
         sock.tcpNoDelay = true
@@ -45,7 +47,8 @@ class ControlClient {
             screen = ScreenInfo(width, height, dpi),
             capabilities = listOf("touch", "pen", "pressure"),
             codecs = listOf("h264"),
-            connectionType = connectionType
+            connectionType = connectionType,
+            deviceId = deviceId
         )
         w.println(hello.toJson())
 
