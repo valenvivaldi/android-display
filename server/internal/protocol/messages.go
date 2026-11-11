@@ -50,3 +50,13 @@ type ClientReady struct {
 type Heartbeat struct {
 	Timestamp int64 `json:"timestamp"`
 }
+
+// ServerMessage is sent by Mac to Android on the control channel after the handshake,
+// one JSON object per line.
+type ServerMessage struct {
+	Type string `json:"type"`
+}
+
+// MessageReconnect asks the phone to drop this connection and connect again, so that
+// changed settings (resolution, bitrate) take effect.
+const MessageReconnect = "reconnect"

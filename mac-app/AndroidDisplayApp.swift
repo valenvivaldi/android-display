@@ -165,6 +165,13 @@ final class ServerController: ObservableObject {
 
     func report(_ message: String) { error = message }
 
+    /// Asks a connected phone to reconnect by itself, so its new settings take effect.
+    /// The server forwards it to the phone, which drops the session and handshakes again.
+    func reconnect(session id: Int) {
+        guard let pipe = stdinPipe else { return }
+        try? pipe.fileHandleForWriting.write(contentsOf: Data("reconnect \(id)\n".utf8))
+    }
+
     /// Starts the server. The scale/bitrate flags are only what a phone gets when the settings
     /// file doesn't cover it; the file itself is what normally decides.
     func start() {
@@ -525,6 +532,13 @@ struct PhoneRow: View {
                 Spacer()
                 if session == nil {
                     Button("Quitar") { settings.forget(id) }.buttonStyle(.link)
+                } else if let session {
+                    if needsReconnect {
+                        Button("Aplicar y reconectar") { ServerController.shared.reconnect(session: session.id) }
+                            .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Reconectar") { ServerController.shared.reconnect(session: session.id) }
+                    }
                 }
             }
 
@@ -548,7 +562,7 @@ struct PhoneRow: View {
             }
 
             if needsReconnect {
-                Text("Reconectá este celular para aplicar el cambio.")
+                Text("Hay cambios sin aplicar: tocá Aplicar y reconectar. El celular se reconecta solo.")
                     .font(.callout)
                     .foregroundStyle(.orange)
             }

@@ -65,6 +65,12 @@ class ControlClient {
         w.println(ClientReady(udpPort).toJson())
     }
 
+    /**
+     * Blocks until the server sends its next control message (one line); null once the server
+     * has closed the connection. Call it from a background thread.
+     */
+    fun readMessage(): String? = reader?.readLine()
+
     fun getSocket(): Socket? = socket
 
     fun disconnect() {

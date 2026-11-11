@@ -63,6 +63,17 @@ class DisplayActivity : AppCompatActivity() {
                 }
             }
 
+            // The Mac asked this phone to reconnect (new settings): start a new connection
+            // from the connect screen, which re-handshakes and picks up the new size and bitrate.
+            service.reconnectCallback = object : DisplayService.ReconnectCallback {
+                override fun onReconnect(host: String, connectionType: String) {
+                    runOnUiThread {
+                        startActivity(MainActivity.reconnectIntent(this@DisplayActivity, host, connectionType))
+                        finish()
+                    }
+                }
+            }
+
             // 設定觸控處理
             setupTouchHandling()
         }
@@ -215,6 +226,7 @@ class DisplayActivity : AppCompatActivity() {
             // 清除回呼避免 leak
             displayService?.videoCallback = null
             displayService?.disconnectCallback = null
+            displayService?.reconnectCallback = null
             unbindService(serviceConnection)
             serviceBound = false
         }

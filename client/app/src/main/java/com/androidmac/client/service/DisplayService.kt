@@ -17,6 +17,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.androidmac.client.R
 import com.androidmac.client.control.ControlClient
+import com.androidmac.client.protocol.ServerMessage
 import com.androidmac.client.touch.TouchEvent
 import com.androidmac.client.touch.TouchSender
 import com.androidmac.client.video.LatencyStats
@@ -77,6 +78,11 @@ class DisplayService : Service() {
         fun onDisconnected()
     }
 
+    /** 重新連線回呼，由 DisplayActivity 註冊 — the Mac asked this phone to connect again */
+    interface ReconnectCallback {
+        fun onReconnect(host: String, connectionType: String)
+    }
+
     // 連線狀態
     private var controlClient: ControlClient? = null
     private var udpReceiver: UdpReceiver? = null
@@ -93,6 +99,8 @@ class DisplayService : Service() {
     var videoCallback: VideoCallback? = null
     @Volatile
     var disconnectCallback: DisconnectCallback? = null
+    @Volatile
+    var reconnectCallback: ReconnectCallback? = null
 
     // 快取最近一組 SPS/PPS，供解碼器重啟時注入（例如鎖屏解鎖後）
     @Volatile
@@ -280,19 +288,27 @@ class DisplayService : Service() {
     }
 
     /**
-     * 監控 TCP 控制連線是否斷開
+     * 監控 TCP 控制連線：連線中斷就斷線；收到 server 的 reconnect 訊息就重新連線。
+     * Watches the control connection: a closed connection disconnects, and a "reconnect"
+     * message from the Mac makes the phone connect again with its current settings.
      */
     private fun monitorControlConnection() {
         serviceScope.launch {
             try {
-                val socket = controlClient?.getSocket() ?: return@launch
-                val buf = ByteArray(1)
+                val client = controlClient ?: return@launch
                 while (true) {
-                    val n = socket.getInputStream().read(buf)
-                    if (n == -1) {
+                    val line = client.readMessage()
+                    if (line == null) {
                         Log.d(TAG, "Control connection closed by server")
                         Handler(Looper.getMainLooper()).post { disconnect() }
                         return@launch
+                    }
+                    when (ServerMessage.typeOf(line)) {
+                        ServerMessage.RECONNECT -> {
+                            Handler(Looper.getMainLooper()).post { reconnect() }
+                            return@launch
+                        }
+                        else -> Log.d(TAG, "Ignoring control message: $line")
                     }
                 }
             } catch (e: IOException) {
@@ -441,6 +457,22 @@ class DisplayService : Service() {
         stopSelf()
     }
 
+    /**
+     * The Mac asked for a reconnect: close this connection (the Mac ends the session) and let
+     * the activity start a new one. Without a visible activity this is a plain disconnect.
+     */
+    fun reconnect() {
+        Log.d(TAG, "Reconnecting at the Mac's request...")
+        val host = serverHost
+        val type = connectionType
+        val callback = reconnectCallback
+        disconnectCallback = null // the activity handles this as a reconnect, not a plain disconnect
+        cleanupConnections()
+        callback?.onReconnect(host, type)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     private fun cleanupConnections() {
         receiveJob?.cancel()
         receiveJob = null
@@ -457,6 +489,7 @@ class DisplayService : Service() {
         controlClient = null
         videoCallback = null
         disconnectCallback = null
+        reconnectCallback = null
     }
 
     // ——— 通知相關 ———
